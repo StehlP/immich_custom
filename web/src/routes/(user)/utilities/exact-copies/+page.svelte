@@ -23,8 +23,15 @@
 
   let { data }: Props = $props();
 
-  type CopyItem = { assetId: string; path: string; originalPath: string; originalFileName: string; key: string };
-  type CopyGroup = { key: string; copyDir: string; originalDir: string; items: CopyItem[] };
+  type CopyItem = {
+    assetId: string;
+    path: string;
+    originalPath: string;
+    originalFileName: string;
+    takenAt: number;
+    key: string;
+  };
+  type CopyGroup = { key: string; copyDir: string; originalDir: string; latest: number; items: CopyItem[] };
 
   let assets = $state<AssetWithCopies[]>([]);
   let isLoading = $state(true);
@@ -42,12 +49,13 @@
         path,
         originalPath: asset.originalPath,
         originalFileName: asset.originalFileName,
+        takenAt: new Date(asset.fileCreatedAt).getTime() || 0,
         key: keyOf(asset.id, path),
       })),
     ),
   );
 
-  // one group per (folder of the copies, folder of their originals), biggest first
+  // one group per (folder of the copies, folder of their originals), most recent photos first
   const groups = $derived.by<CopyGroup[]>(() => {
     const byKey = new Map<string, CopyGroup>();
     for (const item of items) {
@@ -56,16 +64,17 @@
       const key = `${copyDir}\n${originalDir}`;
       let group = byKey.get(key);
       if (!group) {
-        group = { key, copyDir, originalDir, items: [] };
+        group = { key, copyDir, originalDir, latest: 0, items: [] };
         byKey.set(key, group);
       }
       group.items.push(item);
+      group.latest = Math.max(group.latest, item.takenAt);
     }
     const sorted = [...byKey.values()];
     for (const group of sorted) {
-      group.items.sort((a, b) => a.path.localeCompare(b.path));
+      group.items.sort((a, b) => b.takenAt - a.takenAt || a.path.localeCompare(b.path));
     }
-    return sorted.sort((a, b) => b.items.length - a.items.length || a.copyDir.localeCompare(b.copyDir));
+    return sorted.sort((a, b) => b.latest - a.latest || a.copyDir.localeCompare(b.copyDir));
   });
 
   const isAllSelected = $derived(items.length > 0 && selected.size === items.length);
@@ -192,6 +201,11 @@
                 {group.items.length} cop{group.items.length > 1 ? 'ies' : 'ie'}
               </span>
             </label>
+            {#if group.latest > 0}
+              <span class="text-xs opacity-60" title="Date de la photo la plus récente du groupe">
+                {new Date(group.latest).toLocaleDateString()}
+              </span>
+            {/if}
             <div class="flex min-w-0 grow flex-wrap items-center gap-2 text-sm">
               <!-- eslint-disable-next-line svelte/no-navigation-without-resolve this is supposed to be treated as an absolute/external link -->
               <a

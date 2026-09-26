@@ -860,11 +860,11 @@ export class AssetRepository {
     const rows = await this.db
       .selectFrom('asset_metadata')
       .innerJoin('asset', 'asset.id', 'asset_metadata.assetId')
-      .select(['asset.id', 'asset.originalPath', 'asset.originalFileName', 'asset_metadata.value'])
+      .select(['asset.id', 'asset.originalPath', 'asset.originalFileName', 'asset.fileCreatedAt', 'asset_metadata.value'])
       .where('asset_metadata.key', '=', EXTERNAL_COPIES_KEY)
       .where('asset.ownerId', '=', asUuid(ownerId))
       .where('asset.deletedAt', 'is', null)
-      .orderBy('asset.originalPath')
+      .orderBy('asset.fileCreatedAt', 'desc')
       .execute();
 
     return rows.map(({ value, ...asset }) => ({ ...asset, copies: toPaths(value).sort() }));

@@ -7,6 +7,8 @@ export type AssetWithCopies = {
   id: string;
   originalPath: string;
   originalFileName: string;
+  /** capture date, ISO string */
+  fileCreatedAt: string;
   copies: string[];
 };
 
