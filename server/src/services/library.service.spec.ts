@@ -359,10 +359,10 @@ describe(LibraryService.name, () => {
 
       await expect(sut.handleSyncAssets(mockAssetJob)).resolves.toBe(JobStatus.Success);
 
-      expect(mocks.asset.updateAllIfPathUnchanged).toHaveBeenCalledWith(
-        [{ id: asset.id, originalPath: asset.originalPath }],
-        { isOffline: true, deletedAt: expect.anything() },
-      );
+      expect(mocks.asset.updateAll).toHaveBeenCalledWith([asset.id], {
+        isOffline: true,
+        deletedAt: expect.anything(),
+      });
     });
 
     it('should set assets deleted from disk as offline', async () => {
@@ -381,10 +381,10 @@ describe(LibraryService.name, () => {
 
       await expect(sut.handleSyncAssets(mockAssetJob)).resolves.toBe(JobStatus.Success);
 
-      expect(mocks.asset.updateAllIfPathUnchanged).toHaveBeenCalledWith(
-        [{ id: asset.id, originalPath: asset.originalPath }],
-        { isOffline: true, deletedAt: expect.anything() },
-      );
+      expect(mocks.asset.updateAll).toHaveBeenCalledWith([asset.id], {
+        isOffline: true,
+        deletedAt: expect.anything(),
+      });
     });
 
     it('should do nothing with offline assets deleted from disk', async () => {
@@ -550,8 +550,6 @@ describe(LibraryService.name, () => {
         mtime: new Date('2023-01-01'),
         ctime: new Date('2023-01-01'),
       } as Stats);
-      mocks.asset.filterNewExternalAssetPaths.mockImplementation((_, paths) => Promise.resolve(paths));
-      mocks.crypto.hashFile.mockImplementation((path) => Promise.resolve(Buffer.from(`${path} (file-hashed)`)));
     });
 
     it('should import a new asset', async () => {
