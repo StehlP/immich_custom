@@ -1,7 +1,10 @@
 <script lang="ts">
+  import { Route } from '$lib/route';
   import { handleError } from '$lib/utils/handle-error';
+  import { getParentPath } from '$lib/utils/tree-utils';
   import { getAssetMetadata, type AssetResponseDto } from '@immich/sdk';
-  import { Button, toastManager } from '@immich/ui';
+  import { IconButton, toastManager } from '@immich/ui';
+  import { mdiSwapVertical } from '@mdi/js';
 
   interface Props {
     asset: AssetResponseDto;
@@ -57,23 +60,33 @@
 </script>
 
 {#if copies.length > 0}
-  <div class="pt-1 pb-2 text-xs">
-    <p class="opacity-70">Copies identiques ({copies.length})</p>
+  <div class="pb-2 text-xs">
+    <p class="pt-1 opacity-70">
+      {copies.length === 1 ? '1 copie identique' : `${copies.length} copies identiques`}
+    </p>
     <ul>
       {#each copies as path (path)}
-        <li class="flex items-center gap-2 py-1">
-          <span class="grow break-all whitespace-pre-wrap opacity-50">{path}</span>
-          <Button
-            size="small"
-            variant="outline"
-            color="secondary"
-            class="shrink-0"
-            disabled={pendingPath !== null}
-            loading={pendingPath === path}
-            onclick={() => setAsOriginal(path)}
+        <li class="flex items-center gap-1">
+          <!-- eslint-disable-next-line svelte/no-navigation-without-resolve this is supposed to be treated as an absolute/external link -->
+          <a
+            href={Route.folders({ path: getParentPath(path) })}
+            title="Aller au dossier"
+            class="min-w-0 grow break-all whitespace-pre-wrap opacity-50 hover:text-primary"
           >
-            Définir comme original
-          </Button>
+            {path}
+          </a>
+          <span class="shrink-0" title="Définir comme original">
+            <IconButton
+              icon={mdiSwapVertical}
+              aria-label="Définir comme original"
+              size="small"
+              shape="round"
+              color="secondary"
+              variant="ghost"
+              disabled={pendingPath !== null}
+              onclick={() => setAsOriginal(path)}
+            />
+          </span>
         </li>
       {/each}
     </ul>
