@@ -3,7 +3,7 @@ import { Stats } from 'node:fs';
 import { JOBS_LIBRARY_PAGINATION_SIZE } from 'src/constants';
 import { defaults, SystemConfig } from 'src/dtos/config.dto';
 import { mapLibrary } from 'src/dtos/library.dto';
-import { AssetType, CronJob, ImmichWorker, JobName, JobStatus } from 'src/enum';
+import { AssetStatus, AssetType, ChecksumAlgorithm, CronJob, ImmichWorker, JobName, JobStatus } from 'src/enum';
 import { LibraryService } from 'src/services/library.service';
 import { ILibraryBulkIdsJob, ILibraryFileJob } from 'src/types';
 import { AssetFactory } from 'test/factories/asset.factory';
@@ -359,10 +359,10 @@ describe(LibraryService.name, () => {
 
       await expect(sut.handleSyncAssets(mockAssetJob)).resolves.toBe(JobStatus.Success);
 
-      expect(mocks.asset.updateAll).toHaveBeenCalledWith([asset.id], {
-        isOffline: true,
-        deletedAt: expect.anything(),
-      });
+      expect(mocks.asset.updateAllIfPathUnchanged).toHaveBeenCalledWith(
+        [{ id: asset.id, originalPath: asset.originalPath }],
+        { isOffline: true, deletedAt: expect.anything() },
+      );
     });
 
     it('should set assets deleted from disk as offline', async () => {
@@ -381,10 +381,60 @@ describe(LibraryService.name, () => {
 
       await expect(sut.handleSyncAssets(mockAssetJob)).resolves.toBe(JobStatus.Success);
 
-      expect(mocks.asset.updateAll).toHaveBeenCalledWith([asset.id], {
-        isOffline: true,
-        deletedAt: expect.anything(),
+      expect(mocks.asset.updateAllIfPathUnchanged).toHaveBeenCalledWith(
+        [{ id: asset.id, originalPath: asset.originalPath }],
+        { isOffline: true, deletedAt: expect.anything() },
+      );
+    });
+
+    it('should switch to an existing copy instead of offlining the asset', async () => {
+      const asset = AssetFactory.create({ libraryId: 'library-id', isExternal: true, originalPath: '/data/a.jpg' });
+      const mockAssetJob: ILibraryBulkIdsJob = {
+        assetIds: [asset.id],
+        libraryId: newUuid(),
+        importPaths: ['/'],
+        exclusionPatterns: [],
+        totalAssets: 1,
+        progressCounter: 0,
+      };
+
+      mocks.assetJob.getForSyncAssets.mockResolvedValue([asset]);
+      mocks.storage.stat.mockRejectedValue(new Error('ENOENT'));
+      mocks.asset.getExternalCopiesByAssetIds.mockResolvedValue(new Map([[asset.id, ['/data/gone.jpg', '/data/b.jpg']]]));
+      mocks.storage.checkFileExists.mockImplementation((path: string) => Promise.resolve(path === '/data/b.jpg'));
+
+      await sut.handleSyncAssets(mockAssetJob);
+
+      expect(mocks.asset.removeExternalCopy).toHaveBeenCalledWith(asset.id, '/data/gone.jpg');
+      expect(mocks.asset.swapExternalOriginal).toHaveBeenCalledWith(asset.id, {
+        from: '/data/a.jpg',
+        to: '/data/b.jpg',
+        keepFrom: false,
+        values: { originalPath: '/data/b.jpg', originalFileName: 'b.jpg', isOffline: false, deletedAt: null },
       });
+      expect(mocks.asset.updateAllIfPathUnchanged).not.toHaveBeenCalled();
+    });
+
+    it('should remove copies that no longer exist', async () => {
+      const asset = AssetFactory.create({ libraryId: 'library-id', isExternal: true, fileModifiedAt: new Date('2023-01-01') });
+      const mockAssetJob: ILibraryBulkIdsJob = {
+        assetIds: [asset.id],
+        libraryId: newUuid(),
+        importPaths: ['/'],
+        exclusionPatterns: [],
+        totalAssets: 1,
+        progressCounter: 0,
+      };
+
+      mocks.assetJob.getForSyncAssets.mockResolvedValue([asset]);
+      mocks.storage.stat.mockResolvedValue({ mtime: new Date('2023-01-01') } as Stats);
+      mocks.asset.getExternalCopiesByAssetIds.mockResolvedValue(new Map([[asset.id, ['/data/gone.jpg']]]));
+      mocks.storage.checkFileExists.mockResolvedValue(false);
+
+      await sut.handleSyncAssets(mockAssetJob);
+
+      expect(mocks.asset.removeExternalCopy).toHaveBeenCalledWith(asset.id, '/data/gone.jpg');
+      expect(mocks.asset.swapExternalOriginal).not.toHaveBeenCalled();
     });
 
     it('should do nothing with offline assets deleted from disk', async () => {
@@ -550,6 +600,206 @@ describe(LibraryService.name, () => {
         mtime: new Date('2023-01-01'),
         ctime: new Date('2023-01-01'),
       } as Stats);
+      mocks.asset.filterNewExternalAssetPaths.mockImplementation((_, paths) => Promise.resolve(paths));
+      mocks.crypto.hashFile.mockImplementation((path) => Promise.resolve(Buffer.from(`${path} (file-hashed)`)));
+    });
+
+    it('should import a new asset with a content checksum', async () => {
+      const library = factory.library();
+      const asset = AssetFactory.create();
+
+      mocks.asset.createAll.mockResolvedValue([asset.id]);
+      mocks.library.get.mockResolvedValue(library);
+
+      await sut.handleSyncFiles({ libraryId: library.id, paths: ['/data/user1/photo.jpg'] });
+
+      expect(mocks.asset.createAll).toHaveBeenCalledWith([
+        expect.objectContaining({
+          checksum: Buffer.from('/data/user1/photo.jpg (file-hashed)'),
+          checksumAlgorithm: ChecksumAlgorithm.sha1File,
+        }),
+      ]);
+    });
+
+    it('should skip paths that are already in the library', async () => {
+      const library = factory.library();
+
+      mocks.library.get.mockResolvedValue(library);
+      mocks.asset.createAll.mockResolvedValue([]);
+      mocks.asset.filterNewExternalAssetPaths.mockResolvedValue([]);
+
+      await sut.handleSyncFiles({ libraryId: library.id, paths: ['/data/user1/photo.jpg'] });
+
+      expect(mocks.crypto.hashFile).not.toHaveBeenCalled();
+      expect(mocks.asset.createAll).not.toHaveBeenCalled();
+    });
+
+    it('should save imports in batches of 1000 files', async () => {
+      const library = factory.library();
+      const paths = Array.from({ length: 2500 }, (_, index) => `/data/user1/photo-${index}.jpg`);
+
+      mocks.library.get.mockResolvedValue(library);
+      mocks.asset.createAll.mockResolvedValue([]);
+
+      await sut.handleSyncFiles({ libraryId: library.id, paths });
+
+      expect(mocks.asset.createAll).toHaveBeenCalledTimes(3);
+      expect(mocks.asset.createAll.mock.calls[0][0]).toHaveLength(1000);
+      expect(mocks.asset.createAll.mock.calls[2][0]).toHaveLength(500);
+    });
+
+    it('should detect a moved file and keep the existing asset', async () => {
+      const library = factory.library();
+      const existing = AssetFactory.create({ libraryId: library.id, originalPath: '/data/user1/old/photo.jpg' });
+
+      mocks.library.get.mockResolvedValue(library);
+      mocks.asset.createAll.mockResolvedValue([]);
+      mocks.asset.getByChecksum.mockResolvedValueOnce(existing as any);
+      mocks.storage.checkFileExists.mockResolvedValue(false);
+
+      await sut.handleSyncFiles({ libraryId: library.id, paths: ['/data/user1/new/photo.jpg'] });
+
+      expect(mocks.asset.updateAll).toHaveBeenCalledWith([existing.id], {
+        originalPath: '/data/user1/new/photo.jpg',
+        originalFileName: 'photo.jpg',
+        fileModifiedAt: new Date('2023-01-01'),
+        isOffline: false,
+        deletedAt: null,
+      });
+      expect(mocks.asset.createAll).toHaveBeenCalledWith([]);
+      expect(mocks.job.queueAll).toHaveBeenCalledWith([
+        { name: JobName.SidecarCheck, data: { id: existing.id, source: 'upload' } },
+      ]);
+    });
+
+    it('should keep a user-trashed asset in the trash when its file moved', async () => {
+      const library = factory.library();
+      const existing = AssetFactory.create({
+        libraryId: library.id,
+        originalPath: '/data/user1/old/photo.jpg',
+        status: AssetStatus.Trashed,
+        deletedAt: new Date(),
+      });
+
+      mocks.library.get.mockResolvedValue(library);
+      mocks.asset.createAll.mockResolvedValue([]);
+      mocks.asset.getByChecksum.mockResolvedValueOnce(existing as any);
+      mocks.storage.checkFileExists.mockResolvedValue(false);
+
+      await sut.handleSyncFiles({ libraryId: library.id, paths: ['/data/user1/new/photo.jpg'] });
+
+      expect(mocks.asset.updateAll).toHaveBeenCalledWith([existing.id], {
+        originalPath: '/data/user1/new/photo.jpg',
+        originalFileName: 'photo.jpg',
+        fileModifiedAt: new Date('2023-01-01'),
+        isOffline: false,
+      });
+    });
+
+    it('should record an identical file as a copy of the existing asset', async () => {
+      const library = factory.library();
+      const existing = AssetFactory.create({ libraryId: library.id, originalPath: '/data/user1/old/photo.jpg' });
+
+      mocks.library.get.mockResolvedValue(library);
+      mocks.asset.createAll.mockResolvedValue([]);
+      mocks.asset.getByChecksum.mockResolvedValueOnce(existing as any);
+      mocks.storage.checkFileExists.mockResolvedValue(true);
+
+      await sut.handleSyncFiles({ libraryId: library.id, paths: ['/data/user1/copy/photo.jpg'] });
+
+      expect(mocks.asset.addExternalCopy).toHaveBeenCalledWith(existing.id, '/data/user1/copy/photo.jpg');
+      expect(mocks.asset.updateAll).not.toHaveBeenCalled();
+      expect(mocks.asset.createAll).toHaveBeenCalledWith([]);
+    });
+
+    it('should record every identical file of the same batch as a copy', async () => {
+      const library = factory.library();
+      const existing = AssetFactory.create({ libraryId: library.id, originalPath: '/data/user1/photo.jpg' });
+
+      mocks.library.get.mockResolvedValue(library);
+      mocks.asset.createAll.mockResolvedValue([]);
+      mocks.asset.getByChecksum.mockResolvedValue(existing as any);
+      mocks.storage.checkFileExists.mockResolvedValue(true);
+
+      await sut.handleSyncFiles({ libraryId: library.id, paths: ['/data/user1/a.jpg', '/data/user1/b.jpg'] });
+
+      expect(mocks.asset.addExternalCopy).toHaveBeenCalledTimes(2);
+    });
+
+    it('should remove a copy from its asset when its content changed', async () => {
+      const library = factory.library();
+
+      mocks.library.get.mockResolvedValue(library);
+      mocks.asset.createAll.mockResolvedValue([]);
+      mocks.asset.getExternalCopyOwnerId.mockResolvedValue('owner-id');
+
+      await sut.handleSyncFiles({ libraryId: library.id, paths: ['/data/user1/edited.jpg'] });
+
+      expect(mocks.asset.removeExternalCopy).toHaveBeenCalledWith('owner-id', '/data/user1/edited.jpg');
+      expect(mocks.asset.createAll).toHaveBeenCalledWith([
+        expect.objectContaining({ originalPath: '/data/user1/edited.jpg' }),
+      ]);
+    });
+
+    it('should move a copy to another asset when its content now matches it', async () => {
+      const library = factory.library();
+      const existing = AssetFactory.create({ libraryId: library.id, originalPath: '/data/user1/other.jpg' });
+
+      mocks.library.get.mockResolvedValue(library);
+      mocks.asset.createAll.mockResolvedValue([]);
+      mocks.asset.getExternalCopyOwnerId.mockResolvedValue('previous-owner');
+      mocks.asset.getByChecksum.mockResolvedValueOnce(existing as any);
+      mocks.storage.checkFileExists.mockResolvedValue(true);
+
+      await sut.handleSyncFiles({ libraryId: library.id, paths: ['/data/user1/copy.jpg'] });
+
+      expect(mocks.asset.removeExternalCopy).toHaveBeenCalledWith('previous-owner', '/data/user1/copy.jpg');
+      expect(mocks.asset.addExternalCopy).toHaveBeenCalledWith(existing.id, '/data/user1/copy.jpg');
+    });
+
+    it('should promote a copy to original when the original file is gone', async () => {
+      const library = factory.library();
+      const existing = AssetFactory.create({ libraryId: library.id, originalPath: '/data/user1/photo.jpg' });
+
+      mocks.library.get.mockResolvedValue(library);
+      mocks.asset.createAll.mockResolvedValue([]);
+      mocks.asset.getExternalCopyOwnerId.mockResolvedValue(existing.id);
+      mocks.asset.getByChecksum.mockResolvedValueOnce(existing as any);
+      mocks.storage.checkFileExists.mockResolvedValue(false);
+
+      await sut.handleSyncFiles({ libraryId: library.id, paths: ['/data/user1/copy.jpg'] });
+
+      expect(mocks.asset.removeExternalCopy).toHaveBeenCalledWith(existing.id, '/data/user1/copy.jpg');
+      expect(mocks.asset.updateAll).toHaveBeenCalledWith(
+        [existing.id],
+        expect.objectContaining({ originalPath: '/data/user1/copy.jpg', originalFileName: 'copy.jpg' }),
+      );
+    });
+
+    it('should ignore a file whose upload is being moved into the library', async () => {
+      const library = factory.library();
+      // outside of the media location (/data in tests), i.e. already moved out of the Immich storage
+      const upload = AssetFactory.create({ libraryId: null, originalPath: '/mnt/photos/iphone_upload/photo.jpg' });
+
+      mocks.library.get.mockResolvedValue(library);
+      mocks.asset.createAll.mockResolvedValue([]);
+      mocks.asset.getByChecksum.mockResolvedValueOnce(undefined).mockResolvedValueOnce(upload as any);
+
+      await sut.handleSyncFiles({ libraryId: library.id, paths: ['/mnt/photos/iphone_upload/photo.jpg'] });
+
+      expect(mocks.asset.createAll).toHaveBeenCalledWith([]);
+    });
+
+    it('should import only one of two identical new files', async () => {
+      const library = factory.library();
+
+      mocks.library.get.mockResolvedValue(library);
+      mocks.asset.createAll.mockResolvedValue([]);
+      mocks.crypto.hashFile.mockResolvedValue(Buffer.from('same content'));
+
+      await sut.handleSyncFiles({ libraryId: library.id, paths: ['/data/user1/a.jpg', '/data/user1/b.jpg'] });
+
+      expect(mocks.asset.createAll).toHaveBeenCalledWith([expect.objectContaining({ isExternal: true })]);
     });
 
     it('should import a new asset', async () => {
@@ -605,6 +855,100 @@ describe(LibraryService.name, () => {
       await expect(sut.handleSyncFiles(mockLibraryJob)).resolves.toBe(JobStatus.Failed);
 
       expect(mocks.asset.createAll.mock.calls).toEqual([]);
+    });
+  });
+
+  describe('handleAssetRemoval', () => {
+    it('should switch to an existing copy when the original file is deleted', async () => {
+      const asset = AssetFactory.create({ originalPath: '/data/a.jpg', checksumAlgorithm: ChecksumAlgorithm.sha1File });
+
+      mocks.asset.getByLibraryIdAndOriginalPath.mockResolvedValue(asset as any);
+      mocks.asset.getExternalCopies.mockResolvedValue(['/data/b.jpg']);
+      mocks.storage.checkFileExists.mockResolvedValue(true);
+
+      await sut.handleAssetRemoval({ libraryId: 'library-id', paths: ['/data/a.jpg'] });
+
+      expect(mocks.asset.swapExternalOriginal).toHaveBeenCalledWith(
+        asset.id,
+        expect.objectContaining({ from: '/data/a.jpg', to: '/data/b.jpg', keepFrom: false }),
+      );
+      expect(mocks.asset.updateAll).not.toHaveBeenCalled();
+    });
+
+    it('should offline the asset when it has no copy left', async () => {
+      const asset = AssetFactory.create({ originalPath: '/data/a.jpg', checksumAlgorithm: ChecksumAlgorithm.sha1File });
+
+      mocks.asset.getByLibraryIdAndOriginalPath.mockResolvedValue(asset as any);
+
+      await sut.handleAssetRemoval({ libraryId: 'library-id', paths: ['/data/a.jpg'] });
+
+      expect(mocks.asset.updateAll).toHaveBeenCalledWith([asset.id], { isOffline: true, deletedAt: expect.any(Date) });
+    });
+
+    it('should remove a deleted copy from its asset', async () => {
+      mocks.asset.getByLibraryIdAndOriginalPath.mockResolvedValue(undefined);
+      mocks.asset.getExternalCopyOwnerId.mockResolvedValue('owner-id');
+
+      await sut.handleAssetRemoval({ libraryId: 'library-id', paths: ['/data/copy.jpg'] });
+
+      expect(mocks.asset.removeExternalCopy).toHaveBeenCalledWith('owner-id', '/data/copy.jpg');
+    });
+  });
+
+  describe('setExternalOriginal', () => {
+    it('should swap the original file with a copy', async () => {
+      const asset = AssetFactory.create({ libraryId: 'library-id', originalPath: '/data/a.jpg' });
+
+      mocks.access.asset.checkOwnerAccess.mockResolvedValue(new Set([asset.id]));
+      mocks.asset.getById.mockResolvedValue(asset as any);
+      mocks.asset.getExternalCopies.mockResolvedValue(['/data/b.jpg']);
+      mocks.storage.checkFileExists.mockResolvedValue(true);
+
+      await sut.setExternalOriginal(authStub.admin, asset.id, { path: '/data/b.jpg' });
+
+      expect(mocks.asset.swapExternalOriginal).toHaveBeenCalledWith(asset.id, {
+        from: '/data/a.jpg',
+        to: '/data/b.jpg',
+        keepFrom: true,
+        values: { originalPath: '/data/b.jpg', originalFileName: 'b.jpg', isOffline: false, deletedAt: null },
+      });
+      expect(mocks.job.queueAll).toHaveBeenCalledWith([
+        { name: JobName.SidecarCheck, data: { id: asset.id, source: 'upload' } },
+      ]);
+    });
+
+    it('should refuse a path that is not a known copy', async () => {
+      const asset = AssetFactory.create({ libraryId: 'library-id' });
+
+      mocks.access.asset.checkOwnerAccess.mockResolvedValue(new Set([asset.id]));
+      mocks.asset.getById.mockResolvedValue(asset as any);
+      mocks.asset.getExternalCopies.mockResolvedValue(['/data/b.jpg']);
+
+      await expect(sut.setExternalOriginal(authStub.admin, asset.id, { path: '/etc/passwd' })).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
+      expect(mocks.asset.swapExternalOriginal).not.toHaveBeenCalled();
+    });
+
+    it('should drop a copy that no longer exists', async () => {
+      const asset = AssetFactory.create({ libraryId: 'library-id' });
+
+      mocks.access.asset.checkOwnerAccess.mockResolvedValue(new Set([asset.id]));
+      mocks.asset.getById.mockResolvedValue(asset as any);
+      mocks.asset.getExternalCopies.mockResolvedValue(['/data/b.jpg']);
+      mocks.storage.checkFileExists.mockResolvedValue(false);
+
+      await expect(sut.setExternalOriginal(authStub.admin, asset.id, { path: '/data/b.jpg' })).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
+      expect(mocks.asset.removeExternalCopy).toHaveBeenCalledWith(asset.id, '/data/b.jpg');
+    });
+
+    it('should require access to the asset', async () => {
+      await expect(sut.setExternalOriginal(authStub.admin, 'asset-id', { path: '/data/b.jpg' })).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
+      expect(mocks.asset.getById).not.toHaveBeenCalled();
     });
   });
 
