@@ -1,5 +1,6 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
+  import DetailPanelCopies from '$lib/components/asset-viewer/DetailPanelCopies.svelte';
   import DetailPanelDate from '$lib/components/asset-viewer/DetailPanelDate.svelte';
   import DetailPanelDescription from '$lib/components/asset-viewer/DetailPanelDescription.svelte';
   import DetailPanelLocation from '$lib/components/asset-viewer/DetailPanelLocation.svelte';
@@ -102,6 +103,10 @@
     await faceManager.getAssetFaces(asset.id);
   };
 
+  const handleOriginalChanged = async () => {
+    asset = await getAssetInfo({ id: asset.id });
+  };
+
   const getAssetFolderHref = (asset: AssetResponseDto) => {
     // Remove the last part of the path to get the parent path
     return Route.folders({ path: getParentPath(asset.originalPath) });
@@ -190,6 +195,9 @@
                 {asset.originalPath}
               </a>
             </p>
+          {/if}
+          {#if isOwner && asset.libraryId}
+            <DetailPanelCopies {asset} onChanged={handleOriginalChanged} />
           {/if}
           {#if (asset.exifInfo?.exifImageHeight && asset.exifInfo.exifImageWidth) || asset.exifInfo?.fileSizeInByte}
             <div class="flex gap-2 text-sm">

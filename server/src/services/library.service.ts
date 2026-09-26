@@ -8,6 +8,8 @@ import picomatch from 'picomatch';
 import { JOBS_LIBRARY_PAGINATION_SIZE } from 'src/constants';
 import { StorageCore } from 'src/cores/storage.core';
 import { OnEvent, OnJob } from 'src/decorators';
+import { AssetCopyOriginalDto } from 'src/dtos/asset-copy.dto';
+import { AuthDto } from 'src/dtos/auth.dto';
 import {
   CreateLibraryDto,
   LibraryResponseDto,
@@ -27,6 +29,7 @@ import {
   ImmichWorker,
   JobName,
   JobStatus,
+  Permission,
   QueueName,
 } from 'src/enum';
 import { ArgOf } from 'src/repositories/event.repository';
@@ -44,6 +47,7 @@ const LIBRARY_RECENT_CHANGE_DELAY_MS = 5 * 60 * 1000;
 type FileSyncResult =
   | { action: 'create'; checksum: Buffer; asset: Insertable<AssetTable> }
   | { action: 'move'; checksum: Buffer; id: string; values: Updateable<AssetTable> }
+  | { action: 'copy'; id: string; path: string }
   | { action: 'skip' };
 
 @Injectable()
@@ -280,6 +284,7 @@ export class LibraryService extends BaseService {
     for (const saveBatch of chunk(paths, LIBRARY_SAVE_BATCH_SIZE)) {
       const assetImports: Insertable<AssetTable>[] = [];
       const moves: Array<{ id: string; values: Updateable<AssetTable> }> = [];
+      const copies: Array<{ id: string; path: string }> = [];
 
       // hashing reads whole files, so limit how many are open at once
       for (const hashBatch of chunk(saveBatch, LIBRARY_HASH_CONCURRENCY)) {
@@ -288,6 +293,11 @@ export class LibraryService extends BaseService {
             try {
               const result = await this.processEntity(path, library.ownerId, job.libraryId);
               if (result.action === 'skip') {
+                return;
+              }
+
+              if (result.action === 'copy') {
+                copies.push({ id: result.id, path: result.path });
                 return;
               }
 
@@ -311,7 +321,7 @@ export class LibraryService extends BaseService {
       }
 
       processed += saveBatch.length;
-      await this.saveSyncedFiles(library, assetImports, moves, `${processed} of ${paths.length} in this job`);
+      await this.saveSyncedFiles(library, assetImports, moves, copies, `${processed} of ${paths.length} in this job`);
     }
 
     return JobStatus.Success;
@@ -321,10 +331,18 @@ export class LibraryService extends BaseService {
     library: { id: string; ownerId: string },
     assetImports: Insertable<AssetTable>[],
     moves: Array<{ id: string; values: Updateable<AssetTable> }>,
+    copies: Array<{ id: string; path: string }>,
     progress: string,
   ) {
     for (const move of moves) {
       await this.assetRepository.updateAll([move.id], move.values);
+    }
+
+    for (const copy of copies) {
+      await this.assetRepository.addExternalCopy(copy.id, copy.path);
+    }
+    if (copies.length > 0) {
+      this.logger.log(`Recorded ${copies.length} identical copy(ies) in library ${library.id}`);
     }
 
     const assetIds = await this.assetRepository.createAll(assetImports);
@@ -451,17 +469,27 @@ export class LibraryService extends BaseService {
     const assetPath = path.normalize(filePath);
     const stat = await this.storageRepository.stat(assetPath);
     const checksum = await this.cryptoRepository.hashFile(assetPath);
+    const copyOwnerId = await this.assetRepository.getExternalCopyOwnerId(libraryId, assetPath);
 
     const existing = await this.assetRepository.getByChecksum({ ownerId, libraryId, checksum });
     if (existing) {
-      const isMove =
-        existing.status !== AssetStatus.Deleted &&
-        existing.originalPath !== assetPath &&
-        !(await this.storageRepository.checkFileExists(existing.originalPath));
-
-      if (!isMove) {
-        this.logger.debug(`Skipping ${assetPath}, same content as asset ${existing.id} at ${existing.originalPath}`);
+      if (existing.status === AssetStatus.Deleted || existing.originalPath === assetPath) {
         return { action: 'skip' };
+      }
+
+      // the file used to be a copy of another asset but its content changed
+      if (copyOwnerId && copyOwnerId !== existing.id) {
+        await this.assetRepository.removeExternalCopy(copyOwnerId, assetPath);
+      }
+
+      const isMove = !(await this.storageRepository.checkFileExists(existing.originalPath));
+      if (!isMove) {
+        this.logger.debug(`Recording ${assetPath} as a copy of asset ${existing.id} at ${existing.originalPath}`);
+        return { action: 'copy', id: existing.id, path: assetPath };
+      }
+
+      if (copyOwnerId === existing.id) {
+        await this.assetRepository.removeExternalCopy(existing.id, assetPath);
       }
 
       this.logger.log(`Detected move of asset ${existing.id}: ${existing.originalPath} => ${assetPath}`);
@@ -471,12 +499,18 @@ export class LibraryService extends BaseService {
         id: existing.id,
         values: {
           originalPath: assetPath,
+          originalFileName: parse(assetPath).base,
           fileModifiedAt: stat.mtime,
           isOffline: false,
           // same rule as un-offlining: an asset trashed by the user stays in the trash
           ...(existing.status === AssetStatus.Trashed ? {} : { deletedAt: null }),
         },
       };
+    }
+
+    if (copyOwnerId) {
+      this.logger.debug(`${assetPath} is no longer identical to asset ${copyOwnerId}, importing it separately`);
+      await this.assetRepository.removeExternalCopy(copyOwnerId, assetPath);
     }
 
     const upload = await this.assetRepository.getByChecksum({ ownerId, checksum });
@@ -544,6 +578,77 @@ export class LibraryService extends BaseService {
     );
   }
 
+  /** when the original file is gone, points the asset to the first identical copy still on disk */
+  private async switchToExistingCopy(
+    asset: { id: string; originalPath: string; status: AssetStatus },
+    copies: string[],
+  ): Promise<boolean> {
+    for (const copy of copies) {
+      if (!(await this.storageRepository.checkFileExists(copy))) {
+        await this.assetRepository.removeExternalCopy(asset.id, copy);
+        continue;
+      }
+
+      await this.assetRepository.swapExternalOriginal(asset.id, {
+        from: asset.originalPath,
+        to: copy,
+        keepFrom: false,
+        values: this.getOriginalValues(copy, asset.status),
+      });
+      await this.queuePostSyncJobs([asset.id]);
+      this.logger.log(`Original of asset ${asset.id} is gone, switched to its copy: ${asset.originalPath} => ${copy}`);
+      return true;
+    }
+
+    return false;
+  }
+
+  private async removeMissingCopies(assetId: string, copies: string[]) {
+    for (const copy of copies) {
+      if (!(await this.storageRepository.checkFileExists(copy))) {
+        this.logger.debug(`Copy ${copy} of asset ${assetId} no longer exists`);
+        await this.assetRepository.removeExternalCopy(assetId, copy);
+      }
+    }
+  }
+
+  private getOriginalValues(originalPath: string, status: AssetStatus): Updateable<AssetTable> {
+    return {
+      originalPath,
+      originalFileName: parse(originalPath).base,
+      isOffline: false,
+      // an asset trashed by the user stays in the trash
+      ...(status === AssetStatus.Trashed ? {} : { deletedAt: null }),
+    };
+  }
+
+  async setExternalOriginal(auth: AuthDto, id: string, dto: AssetCopyOriginalDto): Promise<void> {
+    await this.requireAccess({ auth, permission: Permission.AssetUpdate, ids: [id] });
+
+    const asset = await this.assetRepository.getById(id);
+    if (!asset?.libraryId) {
+      throw new BadRequestException('Asset is not part of an external library');
+    }
+
+    const copies = await this.assetRepository.getExternalCopies(id);
+    if (!copies.includes(dto.path)) {
+      throw new BadRequestException('This file is not a known copy of the asset');
+    }
+
+    if (!(await this.storageRepository.checkFileExists(dto.path))) {
+      await this.assetRepository.removeExternalCopy(id, dto.path);
+      throw new BadRequestException('This copy no longer exists on disk');
+    }
+
+    await this.assetRepository.swapExternalOriginal(id, {
+      from: asset.originalPath,
+      to: dto.path,
+      keepFrom: await this.storageRepository.checkFileExists(asset.originalPath),
+      values: this.getOriginalValues(dto.path, asset.status),
+    });
+    await this.queuePostSyncJobs([id]);
+  }
+
   async queueScan(id: string) {
     await this.findOrFail(id);
 
@@ -603,15 +708,29 @@ export class LibraryService extends BaseService {
       assets.map((asset) => this.storageRepository.stat(asset.originalPath).catch(() => null)),
     );
 
+    const copiesByAssetId = await this.assetRepository.getExternalCopiesByAssetIds(assets.map(({ id }) => id));
+    let switchedCount = 0;
+
     for (let i = 0; i < assets.length; i++) {
       const asset = assets[i];
       const stat = stats[i];
+      const copies = copiesByAssetId.get(asset.id) ?? [];
       const action = this.checkExistingAsset(asset, stat);
+
+      if (action !== AssetSyncResult.OFFLINE && copies.length > 0) {
+        await this.removeMissingCopies(asset.id, copies);
+      }
+
       switch (action) {
         case AssetSyncResult.DO_NOTHING: {
           break;
         }
         case AssetSyncResult.OFFLINE: {
+          if (await this.switchToExistingCopy(asset, copies)) {
+            switchedCount++;
+            break;
+          }
+
           const item = { id: asset.id, originalPath: asset.originalPath };
           if (asset.status === AssetStatus.Trashed) {
             trashedAssetIdsToOffline.push(item);
@@ -681,7 +800,12 @@ export class LibraryService extends BaseService {
 
     await Promise.all(promises);
 
-    const remainingCount = assets.length - assetIdsToOffline.length - assetIdsToUpdate.length - assetIdsToOnline.length;
+    if (switchedCount > 0) {
+      this.logger.log(`${switchedCount} asset(s) switched to an identical copy in library ${job.libraryId}`);
+    }
+
+    const remainingCount =
+      assets.length - assetIdsToOffline.length - assetIdsToUpdate.length - assetIdsToOnline.length - switchedCount;
     const cumulativePercentage = ((100 * job.progressCounter) / job.totalAssets).toFixed(1);
     this.logger.log(
       `Checked existing asset(s): ${assetIdsToOffline.length + trashedAssetIdsToOffline.length} offlined, ${assetIdsToOnline.length + trashedAssetIdsToOnline.length} onlined, ${assetIdsToUpdate.length} updated, ${remainingCount} unchanged of current batch of ${assets.length} (Total progress: ${job.progressCounter} of ${job.totalAssets}, ${cumulativePercentage} %) in library ${job.libraryId}.`,
@@ -808,10 +932,19 @@ export class LibraryService extends BaseService {
     for (const assetPath of job.paths) {
       const asset = await this.assetRepository.getByLibraryIdAndOriginalPath(job.libraryId, assetPath);
       if (!asset) {
+        const copyOwnerId = await this.assetRepository.getExternalCopyOwnerId(job.libraryId, assetPath);
+        if (copyOwnerId) {
+          this.logger.debug(`Copy ${assetPath} of asset ${copyOwnerId} was removed`);
+          await this.assetRepository.removeExternalCopy(copyOwnerId, assetPath);
+        }
         continue;
       }
 
       if (asset.checksumAlgorithm === ChecksumAlgorithm.sha1File) {
+        const copies = await this.assetRepository.getExternalCopies(asset.id);
+        if (await this.switchToExistingCopy(asset, copies)) {
+          continue;
+        }
         // keep it (offline, in the trash) so a move can be detected when the file reappears elsewhere
         await this.assetRepository.updateAll(
           [asset.id],

@@ -59,6 +59,44 @@ import { globToPostgresRegex } from 'src/utils/misc';
 
 export type AssetStats = Record<AssetType, number>;
 
+/** asset_metadata key listing the other files of an external library that have the same content as the asset */
+export const EXTERNAL_COPIES_KEY = 'custom.copies';
+
+const toPaths = (value: unknown): string[] => {
+  const paths = (value as { paths?: unknown } | undefined)?.paths;
+  return Array.isArray(paths) ? paths.filter((path): path is string => typeof path === 'string') : [];
+};
+
+// single statements so that concurrent library jobs cannot overwrite each other's changes
+const editExternalCopies = async (
+  db: Kysely<DB>,
+  assetId: string,
+  { add, remove }: { add?: string; remove?: string },
+) => {
+  const additions = add ? [add] : [];
+  const merged = sql`COALESCE((
+    SELECT jsonb_agg(DISTINCT p)
+    FROM jsonb_array_elements_text(COALESCE(asset_metadata."value"->'paths', '[]'::jsonb) || to_jsonb(${additions}::text[])) AS t(p)
+    WHERE p IS DISTINCT FROM ${remove ?? null}::text
+  ), '[]'::jsonb)`;
+
+  await (add
+    ? sql`
+      INSERT INTO asset_metadata ("assetId", "key", "value")
+      VALUES (${assetId}::uuid, ${EXTERNAL_COPIES_KEY}, jsonb_build_object('paths', to_jsonb(${additions}::text[])))
+      ON CONFLICT ("assetId", "key") DO UPDATE SET "value" = jsonb_build_object('paths', ${merged})`.execute(db)
+    : sql`
+      UPDATE asset_metadata SET "value" = jsonb_build_object('paths', ${merged})
+      WHERE "assetId" = ${assetId}::uuid AND "key" = ${EXTERNAL_COPIES_KEY}`.execute(db));
+
+  await db
+    .deleteFrom('asset_metadata')
+    .where('assetId', '=', asUuid(assetId))
+    .where('key', '=', EXTERNAL_COPIES_KEY)
+    .where(sql<boolean>`"value"->'paths' = '[]'::jsonb`)
+    .execute();
+};
+
 export interface BoundingBox {
   west: number;
   south: number;
@@ -783,6 +821,72 @@ export class AssetRepository {
         )
         .execute();
     }
+  }
+
+  @GenerateSql({ params: [DummyValue.UUID] })
+  async getExternalCopies(assetId: string): Promise<string[]> {
+    const row = await this.db
+      .selectFrom('asset_metadata')
+      .select('value')
+      .where('assetId', '=', asUuid(assetId))
+      .where('key', '=', EXTERNAL_COPIES_KEY)
+      .executeTakeFirst();
+
+    return toPaths(row?.value);
+  }
+
+  @GenerateSql({ params: [[DummyValue.UUID]] })
+  async getExternalCopiesByAssetIds(assetIds: string[]): Promise<Map<string, string[]>> {
+    const copies = new Map<string, string[]>();
+    if (assetIds.length === 0) {
+      return copies;
+    }
+
+    const rows = await this.db
+      .selectFrom('asset_metadata')
+      .select(['assetId', 'value'])
+      .where('assetId', '=', anyUuid(assetIds))
+      .where('key', '=', EXTERNAL_COPIES_KEY)
+      .execute();
+
+    for (const row of rows) {
+      copies.set(row.assetId, toPaths(row.value));
+    }
+    return copies;
+  }
+
+  @GenerateSql({ params: [DummyValue.UUID, DummyValue.STRING] })
+  async getExternalCopyOwnerId(libraryId: string, path: string): Promise<string | undefined> {
+    const row = await this.db
+      .selectFrom('asset_metadata')
+      .innerJoin('asset', 'asset.id', 'asset_metadata.assetId')
+      .select('asset_metadata.assetId')
+      .where('asset_metadata.key', '=', EXTERNAL_COPIES_KEY)
+      .where('asset.libraryId', '=', asUuid(libraryId))
+      .where(sql<boolean>`asset_metadata."value"->'paths' @> jsonb_build_array(${path}::text)`)
+      .limit(1)
+      .executeTakeFirst();
+
+    return row?.assetId;
+  }
+
+  async addExternalCopy(assetId: string, path: string): Promise<void> {
+    await this.db.transaction().execute((trx) => editExternalCopies(trx, assetId, { add: path }));
+  }
+
+  async removeExternalCopy(assetId: string, path: string): Promise<void> {
+    await this.db.transaction().execute((trx) => editExternalCopies(trx, assetId, { remove: path }));
+  }
+
+  /** makes `to` the original file of the asset, and optionally keeps `from` as a copy */
+  async swapExternalOriginal(
+    assetId: string,
+    { from, to, keepFrom, values }: { from: string; to: string; keepFrom: boolean; values: Updateable<AssetTable> },
+  ): Promise<void> {
+    await this.db.transaction().execute(async (trx) => {
+      await trx.updateTable('asset').set(values).where('id', '=', asUuid(assetId)).execute();
+      await editExternalCopies(trx, assetId, { remove: to, add: keepFrom ? from : undefined });
+    });
   }
 
   findLivePhotoMatch(options: LivePhotoSearchOptions) {
