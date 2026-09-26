@@ -206,16 +206,20 @@
                 {new Date(group.latest).toLocaleDateString()}
               </span>
             {/if}
-            <div class="flex min-w-0 grow flex-wrap items-center gap-2 text-sm">
-              <!-- eslint-disable-next-line svelte/no-navigation-without-resolve this is supposed to be treated as an absolute/external link -->
-              <a
-                href={Route.folders({ path: group.copyDir })}
-                class="min-w-0 rounded-lg bg-gray-100 px-2 py-0.5 break-all hover:text-primary dark:bg-immich-dark-gray"
-                title="Dossier des copies"
-              >
-                {group.copyDir}
-              </a>
-              <span title="Définir ce dossier comme original pour tout le groupe">
+            <div class="flex min-w-0 grow flex-wrap items-stretch gap-2 text-sm">
+              <div class="flex min-w-0 items-center gap-2 rounded-lg border-2 border-amber-500 px-2 py-1">
+                <span class="shrink-0 text-xs font-semibold text-amber-600 uppercase dark:text-amber-400">
+                  Copies · affichées ci-dessous
+                </span>
+                <!-- eslint-disable-next-line svelte/no-navigation-without-resolve this is supposed to be treated as an absolute/external link -->
+                <a
+                  href={Route.folders({ path: group.copyDir })}
+                  class="min-w-0 break-all hover:text-primary"
+                  title="Ouvrir le dossier des copies"
+                >
+                  {group.copyDir}
+                </a>
+                <span title="Définir ce dossier comme original pour tout le groupe">
                 <IconButton
                   icon={mdiSwapVertical}
                   aria-label="Définir ce dossier comme original pour tout le groupe"
@@ -239,24 +243,25 @@
                   onclick={() => remove(group.items.map(({ assetId, path }) => ({ assetId, path })))}
                 />
               </span>
-              <span class="flex items-center gap-1 opacity-60">
+              </div>
+              <span class="flex items-center gap-1 text-xs opacity-60">
                 <svg viewBox="0 0 24 24" class="size-4 fill-current" aria-hidden="true"><path d={mdiArrowLeftBold} /></svg>
-                copies des originaux de
+                identiques à
               </span>
-              <!-- eslint-disable-next-line svelte/no-navigation-without-resolve this is supposed to be treated as an absolute/external link -->
-              <a
-                href={Route.folders({ path: group.originalDir })}
-                class="min-w-0 rounded-lg bg-gray-100 px-2 py-0.5 break-all hover:text-primary dark:bg-immich-dark-gray"
-                title="Dossier des originaux"
-              >
-                {group.originalDir}
-              </a>
-              <span
-                class="rounded-full border border-primary px-2 py-0.5 text-xs text-primary"
+              <div
+                class="flex min-w-0 items-center gap-2 rounded-lg border border-dashed border-green-600 px-2 py-1 opacity-80"
                 title="Les photos de ce groupe utilisent actuellement ce dossier comme original"
               >
-                original actuel
-              </span>
+                <span class="shrink-0 text-xs font-semibold text-green-700 uppercase dark:text-green-400">Originaux</span>
+                <!-- eslint-disable-next-line svelte/no-navigation-without-resolve this is supposed to be treated as an absolute/external link -->
+                <a
+                  href={Route.folders({ path: group.originalDir })}
+                  class="min-w-0 break-all hover:text-primary"
+                  title="Ouvrir le dossier des originaux"
+                >
+                  {group.originalDir}
+                </a>
+              </div>
             </div>
           </header>
 
@@ -286,8 +291,15 @@
                       onchange={() => toggle(item.key)}
                     />
                     <span class="min-w-0">
-                      <span class="block truncate text-sm font-medium" title={item.path}>{nameOf(item.path)}</span>
-                      <span class="block truncate opacity-60" title={item.originalPath}>
+                      <span class="flex min-w-0 items-center gap-1">
+                        <span
+                          class="shrink-0 rounded bg-amber-500/20 px-1 text-[10px] font-semibold text-amber-600 uppercase dark:text-amber-400"
+                        >
+                          copie
+                        </span>
+                        <span class="truncate text-sm font-medium" title={item.path}>{nameOf(item.path)}</span>
+                      </span>
+                      <span class="block truncate text-green-700 dark:text-green-400" title={item.originalPath}>
                         original : {nameOf(item.originalPath)}
                       </span>
                     </span>
