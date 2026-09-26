@@ -187,7 +187,7 @@
 
     <div class="flex flex-col gap-6 pb-8">
       {#each groups as group (group.key)}
-        <section class="rounded-2xl border border-gray-300 p-4 dark:border-immich-dark-gray dark:text-white">
+        <section class="rounded-2xl border border-amber-500/50 p-4 dark:text-white">
           <header class="mb-3 flex flex-wrap items-center gap-x-4 gap-y-2">
             <label class="flex cursor-pointer items-center gap-2">
               <input
@@ -207,10 +207,8 @@
               </span>
             {/if}
             <div class="flex min-w-0 grow flex-wrap items-stretch gap-2 text-sm">
-              <div class="flex min-w-0 items-center gap-2 rounded-lg border-2 border-amber-500 px-2 py-1">
-                <span class="shrink-0 text-xs font-semibold text-amber-600 uppercase dark:text-amber-400">
-                  Copies · affichées ci-dessous
-                </span>
+              <div class="flex min-w-0 items-center gap-2 px-2 py-1">
+                <span class="shrink-0 text-xs font-semibold text-amber-600 uppercase dark:text-amber-400">Copies</span>
                 <!-- eslint-disable-next-line svelte/no-navigation-without-resolve this is supposed to be treated as an absolute/external link -->
                 <a
                   href={Route.folders({ path: group.copyDir })}

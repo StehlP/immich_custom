@@ -97,7 +97,7 @@ export const deleteCopies = async (copies: CopyToDelete[]): Promise<string[]> =>
     title: copies.length === 1 ? 'Supprimer la copie' : `Supprimer ${copies.length} copies`,
     prompt:
       (copies.length === 1 ? 'Ce fichier sera supprimé' : `Ces ${copies.length} fichiers seront supprimés`) +
-      " définitivement du NAS, et Syncthing les supprimera aussi de tes autres appareils. L'original de chaque photo est conservé et vérifié avant suppression.",
+      " définitivement du NAS. L'original de chaque photo est conservé et vérifié avant suppression.",
     confirmText: 'Supprimer',
     confirmColor: 'danger',
   });
