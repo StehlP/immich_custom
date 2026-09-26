@@ -581,7 +581,21 @@ describe(LibraryService.name, () => {
       await sut.handleSyncFiles({ libraryId: library.id, paths: ['/data/user1/photo.jpg'] });
 
       expect(mocks.crypto.hashFile).not.toHaveBeenCalled();
-      expect(mocks.asset.createAll).toHaveBeenCalledWith([]);
+      expect(mocks.asset.createAll).not.toHaveBeenCalled();
+    });
+
+    it('should save imports in batches of 1000 files', async () => {
+      const library = factory.library();
+      const paths = Array.from({ length: 2500 }, (_, index) => `/data/user1/photo-${index}.jpg`);
+
+      mocks.library.get.mockResolvedValue(library);
+      mocks.asset.createAll.mockResolvedValue([]);
+
+      await sut.handleSyncFiles({ libraryId: library.id, paths });
+
+      expect(mocks.asset.createAll).toHaveBeenCalledTimes(3);
+      expect(mocks.asset.createAll.mock.calls[0][0]).toHaveLength(1000);
+      expect(mocks.asset.createAll.mock.calls[2][0]).toHaveLength(500);
     });
 
     it('should detect a moved file and keep the existing asset', async () => {

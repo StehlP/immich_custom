@@ -38,6 +38,7 @@ import { mimeTypes } from 'src/utils/mime-types';
 import { batched, findOrFail, handlePromiseError } from 'src/utils/misc';
 
 const LIBRARY_HASH_CONCURRENCY = 8;
+const LIBRARY_SAVE_BATCH_SIZE = 1000;
 const LIBRARY_RECENT_CHANGE_DELAY_MS = 5 * 60 * 1000;
 
 type FileSyncResult =
@@ -272,53 +273,65 @@ export class LibraryService extends BaseService {
     // file watcher events are not pre-filtered like the disk crawl
     const paths = await this.assetRepository.filterNewExternalAssetPaths(library.id, job.paths);
 
-    const assetImports: Insertable<AssetTable>[] = [];
-    const moves: Array<{ id: string; values: Updateable<AssetTable> }> = [];
     const seenChecksums = new Set<string>();
+    let processed = 0;
 
-    // hashing reads whole files, so limit how many are open at once
-    for (const batch of chunk(paths, LIBRARY_HASH_CONCURRENCY)) {
-      await Promise.all(
-        batch.map(async (path) => {
-          try {
-            const result = await this.processEntity(path, library.ownerId, job.libraryId);
-            if (result.action === 'skip') {
-              return;
-            }
+    // hashing a batch of 10k files takes a long time, so save progress regularly
+    for (const saveBatch of chunk(paths, LIBRARY_SAVE_BATCH_SIZE)) {
+      const assetImports: Insertable<AssetTable>[] = [];
+      const moves: Array<{ id: string; values: Updateable<AssetTable> }> = [];
 
-            const key = result.checksum.toString('hex');
-            if (seenChecksums.has(key)) {
-              this.logger.debug(`Skipping ${path}, same content as another file in this batch`);
-              return;
-            }
-            seenChecksums.add(key);
+      // hashing reads whole files, so limit how many are open at once
+      for (const hashBatch of chunk(saveBatch, LIBRARY_HASH_CONCURRENCY)) {
+        await Promise.all(
+          hashBatch.map(async (path) => {
+            try {
+              const result = await this.processEntity(path, library.ownerId, job.libraryId);
+              if (result.action === 'skip') {
+                return;
+              }
 
-            if (result.action === 'move') {
-              moves.push({ id: result.id, values: result.values });
-            } else {
-              assetImports.push(result.asset);
+              const key = result.checksum.toString('hex');
+              if (seenChecksums.has(key)) {
+                this.logger.debug(`Skipping ${path}, same content as another file in this batch`);
+                return;
+              }
+              seenChecksums.add(key);
+
+              if (result.action === 'move') {
+                moves.push({ id: result.id, values: result.values });
+              } else {
+                assetImports.push(result.asset);
+              }
+            } catch (error) {
+              this.logger.error(`Error processing ${path} for library ${job.libraryId}: ${error}`);
             }
-          } catch (error) {
-            this.logger.error(`Error processing ${path} for library ${job.libraryId}: ${error}`);
-          }
-        }),
-      );
+          }),
+        );
+      }
+
+      processed += saveBatch.length;
+      await this.saveSyncedFiles(library, assetImports, moves, `${processed} of ${paths.length} in this job`);
     }
 
+    return JobStatus.Success;
+  }
+
+  private async saveSyncedFiles(
+    library: { id: string; ownerId: string },
+    assetImports: Insertable<AssetTable>[],
+    moves: Array<{ id: string; values: Updateable<AssetTable> }>,
+    progress: string,
+  ) {
     for (const move of moves) {
       await this.assetRepository.updateAll([move.id], move.values);
     }
 
     const assetIds = await this.assetRepository.createAll(assetImports);
 
-    const progressMessage =
-      job.progressCounter && job.totalAssets
-        ? `(${job.progressCounter} of ${job.totalAssets})`
-        : `(${job.progressCounter} done so far)`;
-
-    this.logger.log(`Imported ${assetIds.length} ${progressMessage} file(s) into library ${job.libraryId}`);
+    this.logger.log(`Imported ${assetIds.length} file(s) (${progress}) into library ${library.id}`);
     if (moves.length > 0) {
-      this.logger.log(`Updated path of ${moves.length} moved file(s) in library ${job.libraryId}`);
+      this.logger.log(`Updated path of ${moves.length} moved file(s) in library ${library.id}`);
     }
 
     await Promise.all(
@@ -328,8 +341,6 @@ export class LibraryService extends BaseService {
     );
 
     await this.queuePostSyncJobs([...assetIds, ...moves.map(({ id }) => id)]);
-
-    return JobStatus.Success;
   }
 
   private async validateImportPath(importPath: string): Promise<ValidateLibraryImportPathResponseDto> {
