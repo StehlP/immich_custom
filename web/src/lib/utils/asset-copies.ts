@@ -31,18 +31,58 @@ const request = async <T>(url: string, init?: RequestInit): Promise<T> => {
 
 export const getAssetsWithCopies = () => request<AssetWithCopies[]>('/api/asset-copies');
 
+const putOriginal = (assetId: string, path: string) =>
+  request<void>(`/api/assets/${assetId}/copies/original`, {
+    method: 'PUT',
+    body: JSON.stringify({ path }),
+  });
+
 export const setCopyAsOriginal = async (assetId: string, path: string) => {
   try {
-    await request<void>(`/api/assets/${assetId}/copies/original`, {
-      method: 'PUT',
-      body: JSON.stringify({ path }),
-    });
+    await putOriginal(assetId, path);
     toastManager.primary('Original modifié');
     return true;
   } catch (error) {
     handleError(error, 'Impossible de définir cette copie comme original');
     return false;
   }
+};
+
+/** asks for confirmation, then makes every given copy the original of its photo; returns how many changed */
+export const setCopiesAsOriginal = async (copies: CopyToDelete[], folder: string): Promise<number> => {
+  if (copies.length === 0) {
+    return 0;
+  }
+
+  const isConfirmed = await modalManager.showDialog({
+    title: 'Définir ce dossier comme original',
+    prompt: `Les ${copies.length} photos de ce groupe utiliseront désormais leur fichier de ${folder} comme original. Aucun fichier n'est supprimé ni déplacé.`,
+    confirmText: 'Définir comme original',
+  });
+
+  if (!isConfirmed) {
+    return 0;
+  }
+
+  let changed = 0;
+  const failures: string[] = [];
+  for (const { assetId, path } of copies) {
+    try {
+      await putOriginal(assetId, path);
+      changed++;
+    } catch (error) {
+      failures.push(`${path} (${error instanceof Error ? error.message : error})`);
+    }
+  }
+
+  if (changed > 0) {
+    toastManager.primary(changed === 1 ? '1 original modifié' : `${changed} originaux modifiés`);
+  }
+  for (const failure of failures) {
+    toastManager.warning(`Original inchangé : ${failure}`);
+  }
+
+  return changed;
 };
 
 /** asks for confirmation, deletes the copies from disk and reports the result; returns the deleted paths */

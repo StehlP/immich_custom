@@ -5,6 +5,7 @@
   import {
     deleteCopies,
     getAssetsWithCopies,
+    setCopiesAsOriginal,
     setCopyAsOriginal,
     type AssetWithCopies,
     type CopyToDelete,
@@ -121,6 +122,18 @@
   const removeSelected = () =>
     remove(items.filter(({ key }) => selected.has(key)).map(({ assetId, path }) => ({ assetId, path })));
 
+  const setGroupAsOriginal = async (group: CopyGroup) => {
+    isBusy = true;
+    try {
+      const copies = group.items.map(({ assetId, path }) => ({ assetId, path }));
+      if ((await setCopiesAsOriginal(copies, group.copyDir)) > 0) {
+        await load();
+      }
+    } finally {
+      isBusy = false;
+    }
+  };
+
   const setAsOriginal = async (assetId: string, path: string) => {
     isBusy = true;
     try {
@@ -188,6 +201,18 @@
               >
                 {group.copyDir}
               </a>
+              <span title="Définir ce dossier comme original pour tout le groupe">
+                <IconButton
+                  icon={mdiSwapVertical}
+                  aria-label="Définir ce dossier comme original pour tout le groupe"
+                  size="small"
+                  shape="round"
+                  color="secondary"
+                  variant="ghost"
+                  disabled={isBusy}
+                  onclick={() => setGroupAsOriginal(group)}
+                />
+              </span>
               <span class="flex items-center gap-1 opacity-60">
                 <svg viewBox="0 0 24 24" class="size-4 fill-current" aria-hidden="true"><path d={mdiArrowLeftBold} /></svg>
                 copies des originaux de
@@ -200,6 +225,12 @@
               >
                 {group.originalDir}
               </a>
+              <span
+                class="rounded-full border border-primary px-2 py-0.5 text-xs text-primary"
+                title="Les photos de ce groupe utilisent actuellement ce dossier comme original"
+              >
+                original actuel
+              </span>
             </div>
           </header>
 
