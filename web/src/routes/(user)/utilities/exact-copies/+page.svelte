@@ -10,10 +10,9 @@
     type CopyToDelete,
   } from '$lib/utils/asset-copies';
   import { handleError } from '$lib/utils/handle-error';
-  import { getParentPath } from '$lib/utils/tree-utils';
   import { AssetMediaSize } from '@immich/sdk';
   import { Button, IconButton, LoadingSpinner, Text } from '@immich/ui';
-  import { mdiSwapVertical, mdiTrashCanOutline } from '@mdi/js';
+  import { mdiArrowLeftBold, mdiSwapVertical, mdiTrashCanOutline } from '@mdi/js';
   import { onMount } from 'svelte';
   import type { PageData } from './$types';
 
@@ -23,14 +22,53 @@
 
   let { data }: Props = $props();
 
+  type CopyItem = { assetId: string; path: string; originalPath: string; originalFileName: string; key: string };
+  type CopyGroup = { key: string; copyDir: string; originalDir: string; items: CopyItem[] };
+
   let assets = $state<AssetWithCopies[]>([]);
   let isLoading = $state(true);
   let isBusy = $state(false);
   let selected = $state(new Set<string>());
 
+  const dirOf = (path: string) => path.slice(0, Math.max(0, path.lastIndexOf('/'))) || '/';
+  const nameOf = (path: string) => path.slice(path.lastIndexOf('/') + 1);
   const keyOf = (assetId: string, path: string) => `${assetId}\n${path}`;
-  const allCopies = $derived(assets.flatMap(({ id, copies }) => copies.map((path) => ({ assetId: id, path }))));
-  const isAllSelected = $derived(allCopies.length > 0 && selected.size === allCopies.length);
+
+  const items = $derived<CopyItem[]>(
+    assets.flatMap((asset) =>
+      asset.copies.map((path) => ({
+        assetId: asset.id,
+        path,
+        originalPath: asset.originalPath,
+        originalFileName: asset.originalFileName,
+        key: keyOf(asset.id, path),
+      })),
+    ),
+  );
+
+  // one group per (folder of the copies, folder of their originals), biggest first
+  const groups = $derived.by<CopyGroup[]>(() => {
+    const byKey = new Map<string, CopyGroup>();
+    for (const item of items) {
+      const copyDir = dirOf(item.path);
+      const originalDir = dirOf(item.originalPath);
+      const key = `${copyDir}\n${originalDir}`;
+      let group = byKey.get(key);
+      if (!group) {
+        group = { key, copyDir, originalDir, items: [] };
+        byKey.set(key, group);
+      }
+      group.items.push(item);
+    }
+    const sorted = [...byKey.values()];
+    for (const group of sorted) {
+      group.items.sort((a, b) => a.path.localeCompare(b.path));
+    }
+    return sorted.sort((a, b) => b.items.length - a.items.length || a.copyDir.localeCompare(b.copyDir));
+  });
+
+  const isAllSelected = $derived(items.length > 0 && selected.size === items.length);
+  const isGroupSelected = (group: CopyGroup) => group.items.every(({ key }) => selected.has(key));
 
   const load = async () => {
     try {
@@ -40,7 +78,7 @@
     } finally {
       isLoading = false;
     }
-    const existing = new Set(allCopies.map(({ assetId, path }) => keyOf(assetId, path)));
+    const existing = new Set(items.map(({ key }) => key));
     selected = new Set([...selected].filter((key) => existing.has(key)));
   };
 
@@ -48,20 +86,25 @@
     void load();
   });
 
-  const toggle = (assetId: string, path: string) => {
-    const key = keyOf(assetId, path);
+  const setSelection = (keys: string[], isSelected: boolean) => {
     const next = new Set(selected);
-    if (next.has(key)) {
-      next.delete(key);
-    } else {
-      next.add(key);
+    for (const key of keys) {
+      if (isSelected) {
+        next.add(key);
+      } else {
+        next.delete(key);
+      }
     }
     selected = next;
   };
 
-  const toggleAll = () => {
-    selected = isAllSelected ? new Set() : new Set(allCopies.map(({ assetId, path }) => keyOf(assetId, path)));
-  };
+  const toggle = (key: string) => setSelection([key], !selected.has(key));
+  const toggleGroup = (group: CopyGroup) =>
+    setSelection(
+      group.items.map(({ key }) => key),
+      !isGroupSelected(group),
+    );
+  const toggleAll = () => (selected = isAllSelected ? new Set() : new Set(items.map(({ key }) => key)));
 
   const remove = async (copies: CopyToDelete[]) => {
     isBusy = true;
@@ -76,7 +119,7 @@
   };
 
   const removeSelected = () =>
-    remove(allCopies.filter(({ assetId, path }) => selected.has(keyOf(assetId, path))));
+    remove(items.filter(({ key }) => selected.has(key)).map(({ assetId, path }) => ({ assetId, path })));
 
   const setAsOriginal = async (assetId: string, path: string) => {
     isBusy = true;
@@ -93,16 +136,19 @@
 <UserPageLayout title={data.meta.title} scrollbar={true}>
   {#if isLoading}
     <div class="flex justify-center p-8"><LoadingSpinner /></div>
-  {:else if assets.length === 0}
+  {:else if items.length === 0}
     <p class="flex place-content-center place-items-center p-8 text-center text-lg dark:text-white">
       Aucune copie exacte
     </p>
   {:else}
-    <div class="mb-4 flex flex-wrap items-center gap-4">
+    <div
+      class="sticky top-0 z-10 mb-4 flex flex-wrap items-center gap-4 bg-light py-2 dark:bg-immich-dark-bg dark:text-white"
+    >
       <Text color="muted">
-        {assets.length} photo{assets.length > 1 ? 's' : ''} · {allCopies.length} cop{allCopies.length > 1 ? 'ies' : 'ie'}
+        {items.length} cop{items.length > 1 ? 'ies' : 'ie'} · {assets.length} photo{assets.length > 1 ? 's' : ''} ·
+        {groups.length} groupe{groups.length > 1 ? 's' : ''} de dossiers
       </Text>
-      <label class="flex cursor-pointer items-center gap-2 text-sm dark:text-white">
+      <label class="flex cursor-pointer items-center gap-2 text-sm">
         <input type="checkbox" class="size-4 accent-primary" checked={isAllSelected} onchange={toggleAll} />
         Tout sélectionner
       </label>
@@ -117,78 +163,111 @@
       </Button>
     </div>
 
-    <ul class="flex flex-col gap-2">
-      {#each assets as asset (asset.id)}
-        <li class="flex gap-4 rounded-2xl border border-gray-300 p-3 dark:border-immich-dark-gray dark:text-white">
-          <!-- eslint-disable-next-line svelte/no-navigation-without-resolve this is supposed to be treated as an absolute/external link -->
-          <a href={Route.viewAsset({ id: asset.id })} class="shrink-0" title="Ouvrir la photo">
-            <img
-              src={getAssetMediaUrl({ id: asset.id, size: AssetMediaSize.Thumbnail })}
-              alt={asset.originalFileName}
-              class="size-24 rounded-lg object-cover"
-              loading="lazy"
-            />
-          </a>
+    <div class="flex flex-col gap-6 pb-8">
+      {#each groups as group (group.key)}
+        <section class="rounded-2xl border border-gray-300 p-4 dark:border-immich-dark-gray dark:text-white">
+          <header class="mb-3 flex flex-wrap items-center gap-x-4 gap-y-2">
+            <label class="flex cursor-pointer items-center gap-2">
+              <input
+                type="checkbox"
+                class="size-4 accent-primary"
+                aria-label="Sélectionner tout le groupe"
+                checked={isGroupSelected(group)}
+                onchange={() => toggleGroup(group)}
+              />
+              <span class="font-medium">
+                {group.items.length} cop{group.items.length > 1 ? 'ies' : 'ie'}
+              </span>
+            </label>
+            <div class="flex min-w-0 grow flex-wrap items-center gap-2 text-sm">
+              <!-- eslint-disable-next-line svelte/no-navigation-without-resolve this is supposed to be treated as an absolute/external link -->
+              <a
+                href={Route.folders({ path: group.copyDir })}
+                class="min-w-0 rounded-lg bg-gray-100 px-2 py-0.5 break-all hover:text-primary dark:bg-immich-dark-gray"
+                title="Dossier des copies"
+              >
+                {group.copyDir}
+              </a>
+              <span class="flex items-center gap-1 opacity-60">
+                <svg viewBox="0 0 24 24" class="size-4 fill-current" aria-hidden="true"><path d={mdiArrowLeftBold} /></svg>
+                copies des originaux de
+              </span>
+              <!-- eslint-disable-next-line svelte/no-navigation-without-resolve this is supposed to be treated as an absolute/external link -->
+              <a
+                href={Route.folders({ path: group.originalDir })}
+                class="min-w-0 rounded-lg bg-gray-100 px-2 py-0.5 break-all hover:text-primary dark:bg-immich-dark-gray"
+                title="Dossier des originaux"
+              >
+                {group.originalDir}
+              </a>
+            </div>
+          </header>
 
-          <div class="min-w-0 grow text-sm">
-            <p class="font-medium break-all">{asset.originalFileName}</p>
-            <!-- eslint-disable-next-line svelte/no-navigation-without-resolve this is supposed to be treated as an absolute/external link -->
-            <a
-              href={Route.folders({ path: getParentPath(asset.originalPath) })}
-              title="Aller au dossier"
-              class="text-xs break-all opacity-70 hover:text-primary"
-            >
-              Original : {asset.originalPath}
-            </a>
-
-            <ul class="mt-1">
-              {#each asset.copies as path (path)}
-                <li class="flex items-center gap-2 text-xs">
-                  <input
-                    type="checkbox"
-                    class="size-4 shrink-0 accent-primary"
-                    aria-label="Sélectionner {path}"
-                    checked={selected.has(keyOf(asset.id, path))}
-                    onchange={() => toggle(asset.id, path)}
+          <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
+            {#each group.items as item (item.key)}
+              <div
+                class="flex gap-3 rounded-xl border p-2 text-xs transition-colors {selected.has(item.key)
+                  ? 'border-primary bg-primary/10'
+                  : 'border-gray-200 dark:border-immich-dark-gray'}"
+              >
+                <!-- eslint-disable-next-line svelte/no-navigation-without-resolve this is supposed to be treated as an absolute/external link -->
+                <a href={Route.viewAsset({ id: item.assetId })} class="shrink-0" title="Ouvrir la photo">
+                  <img
+                    src={getAssetMediaUrl({ id: item.assetId, size: AssetMediaSize.Thumbnail })}
+                    alt={item.originalFileName}
+                    class="size-16 rounded-lg object-cover"
+                    loading="lazy"
                   />
-                  <!-- eslint-disable-next-line svelte/no-navigation-without-resolve this is supposed to be treated as an absolute/external link -->
-                  <a
-                    href={Route.folders({ path: getParentPath(path) })}
-                    title="Aller au dossier"
-                    class="min-w-0 grow break-all opacity-50 hover:text-primary"
-                  >
-                    {path}
-                  </a>
-                  <span class="shrink-0" title="Définir comme original">
-                    <IconButton
-                      icon={mdiSwapVertical}
-                      aria-label="Définir comme original"
-                      size="small"
-                      shape="round"
-                      color="secondary"
-                      variant="ghost"
-                      disabled={isBusy}
-                      onclick={() => setAsOriginal(asset.id, path)}
+                </a>
+
+                <div class="flex min-w-0 grow flex-col justify-between">
+                  <label class="flex min-w-0 cursor-pointer items-start gap-2">
+                    <input
+                      type="checkbox"
+                      class="mt-0.5 size-4 shrink-0 accent-primary"
+                      checked={selected.has(item.key)}
+                      onchange={() => toggle(item.key)}
                     />
-                  </span>
-                  <span class="shrink-0" title="Supprimer cette copie">
-                    <IconButton
-                      icon={mdiTrashCanOutline}
-                      aria-label="Supprimer cette copie"
-                      size="small"
-                      shape="round"
-                      color="secondary"
-                      variant="ghost"
-                      disabled={isBusy}
-                      onclick={() => remove([{ assetId: asset.id, path }])}
-                    />
-                  </span>
-                </li>
-              {/each}
-            </ul>
+                    <span class="min-w-0">
+                      <span class="block truncate text-sm font-medium" title={item.path}>{nameOf(item.path)}</span>
+                      <span class="block truncate opacity-60" title={item.originalPath}>
+                        original : {nameOf(item.originalPath)}
+                      </span>
+                    </span>
+                  </label>
+
+                  <div class="flex justify-end">
+                    <span title="Définir comme original">
+                      <IconButton
+                        icon={mdiSwapVertical}
+                        aria-label="Définir comme original"
+                        size="small"
+                        shape="round"
+                        color="secondary"
+                        variant="ghost"
+                        disabled={isBusy}
+                        onclick={() => setAsOriginal(item.assetId, item.path)}
+                      />
+                    </span>
+                    <span title="Supprimer cette copie">
+                      <IconButton
+                        icon={mdiTrashCanOutline}
+                        aria-label="Supprimer cette copie"
+                        size="small"
+                        shape="round"
+                        color="secondary"
+                        variant="ghost"
+                        disabled={isBusy}
+                        onclick={() => remove([{ assetId: item.assetId, path: item.path }])}
+                      />
+                    </span>
+                  </div>
+                </div>
+              </div>
+            {/each}
           </div>
-        </li>
+        </section>
       {/each}
-    </ul>
+    </div>
   {/if}
 </UserPageLayout>
