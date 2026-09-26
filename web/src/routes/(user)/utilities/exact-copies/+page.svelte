@@ -213,6 +213,18 @@
                   onclick={() => setGroupAsOriginal(group)}
                 />
               </span>
+              <span title="Supprimer toutes les copies de ce groupe">
+                <IconButton
+                  icon={mdiTrashCanOutline}
+                  aria-label="Supprimer toutes les copies de ce groupe"
+                  size="small"
+                  shape="round"
+                  color="secondary"
+                  variant="ghost"
+                  disabled={isBusy}
+                  onclick={() => remove(group.items.map(({ assetId, path }) => ({ assetId, path })))}
+                />
+              </span>
               <span class="flex items-center gap-1 opacity-60">
                 <svg viewBox="0 0 24 24" class="size-4 fill-current" aria-hidden="true"><path d={mdiArrowLeftBold} /></svg>
                 copies des originaux de
