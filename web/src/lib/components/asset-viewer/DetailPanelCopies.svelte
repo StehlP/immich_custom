@@ -1,10 +1,10 @@
 <script lang="ts">
   import { Route } from '$lib/route';
-  import { handleError } from '$lib/utils/handle-error';
+  import { deleteCopies, setCopyAsOriginal } from '$lib/utils/asset-copies';
   import { getParentPath } from '$lib/utils/tree-utils';
   import { getAssetMetadata, type AssetResponseDto } from '@immich/sdk';
-  import { IconButton, toastManager } from '@immich/ui';
-  import { mdiSwapVertical } from '@mdi/js';
+  import { IconButton } from '@immich/ui';
+  import { mdiSwapVertical, mdiTrashCanOutline } from '@mdi/js';
 
   interface Props {
     asset: AssetResponseDto;
@@ -17,7 +17,7 @@
   const COPIES_KEY = 'custom.copies';
 
   let copies = $state<string[]>([]);
-  let pendingPath = $state<string | null>(null);
+  let isBusy = $state(false);
 
   const loadCopies = async (id: string) => {
     try {
@@ -37,24 +37,25 @@
   });
 
   const setAsOriginal = async (path: string) => {
-    pendingPath = path;
+    isBusy = true;
     try {
-      const response = await fetch(`/api/assets/${asset.id}/copies/original`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify({ path }),
-      });
-      if (!response.ok) {
-        const body = (await response.json().catch(() => ({}))) as { message?: string };
-        throw new Error(body.message ?? `HTTP ${response.status}`);
+      if (await setCopyAsOriginal(asset.id, path)) {
+        await onChanged();
       }
-      await onChanged();
-      toastManager.primary('Original modifié');
-    } catch (error) {
-      handleError(error, "Impossible de définir cette copie comme original");
     } finally {
-      pendingPath = null;
+      isBusy = false;
+    }
+  };
+
+  const remove = async (path: string) => {
+    isBusy = true;
+    try {
+      const deleted = await deleteCopies([{ assetId: asset.id, path }]);
+      if (deleted.length > 0) {
+        await loadCopies(asset.id);
+      }
+    } finally {
+      isBusy = false;
     }
   };
 </script>
@@ -83,8 +84,20 @@
               shape="round"
               color="secondary"
               variant="ghost"
-              disabled={pendingPath !== null}
+              disabled={isBusy}
               onclick={() => setAsOriginal(path)}
+            />
+          </span>
+          <span class="shrink-0" title="Supprimer cette copie">
+            <IconButton
+              icon={mdiTrashCanOutline}
+              aria-label="Supprimer cette copie"
+              size="small"
+              shape="round"
+              color="secondary"
+              variant="ghost"
+              disabled={isBusy}
+              onclick={() => remove(path)}
             />
           </span>
         </li>

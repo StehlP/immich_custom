@@ -952,6 +952,90 @@ describe(LibraryService.name, () => {
     });
   });
 
+  describe('deleteExternalCopies', () => {
+    const checksum = Buffer.from('photo content');
+    const setup = () => {
+      const asset = AssetFactory.create({ libraryId: 'library-id', originalPath: '/data/a.jpg', checksum });
+      mocks.access.asset.checkOwnerAccess.mockResolvedValue(new Set([asset.id]));
+      mocks.asset.getById.mockResolvedValue(asset as any);
+      mocks.asset.getExternalCopies.mockResolvedValue(['/data/b.jpg']);
+      mocks.storage.checkFileExists.mockResolvedValue(true);
+      mocks.crypto.hashFile.mockResolvedValue(checksum);
+      return asset;
+    };
+
+    it('should delete an identical copy and keep the original', async () => {
+      const asset = setup();
+
+      await expect(
+        sut.deleteExternalCopies(authStub.admin, { items: [{ assetId: asset.id, path: '/data/b.jpg' }] }),
+      ).resolves.toEqual({ deleted: 1, failed: [] });
+
+      expect(mocks.storage.unlink).toHaveBeenCalledWith('/data/b.jpg');
+      expect(mocks.storage.unlink).not.toHaveBeenCalledWith('/data/a.jpg');
+      expect(mocks.asset.removeExternalCopy).toHaveBeenCalledWith(asset.id, '/data/b.jpg');
+    });
+
+    it('should never delete the original file', async () => {
+      const asset = setup();
+
+      const result = await sut.deleteExternalCopies(authStub.admin, { items: [{ assetId: asset.id, path: '/data/a.jpg' }] });
+
+      expect(result.deleted).toBe(0);
+      expect(mocks.storage.unlink).not.toHaveBeenCalled();
+    });
+
+    it('should keep the copy when the original is missing', async () => {
+      const asset = setup();
+      mocks.storage.checkFileExists.mockImplementation((path: string) => Promise.resolve(path !== '/data/a.jpg'));
+
+      const result = await sut.deleteExternalCopies(authStub.admin, { items: [{ assetId: asset.id, path: '/data/b.jpg' }] });
+
+      expect(result).toEqual({ deleted: 0, failed: [{ path: '/data/b.jpg', reason: expect.any(String) }] });
+      expect(mocks.storage.unlink).not.toHaveBeenCalled();
+    });
+
+    it('should keep the copy when the original content changed', async () => {
+      const asset = setup();
+      mocks.crypto.hashFile.mockImplementation((path) =>
+        Promise.resolve(path === '/data/a.jpg' ? Buffer.from('edited') : checksum),
+      );
+
+      const result = await sut.deleteExternalCopies(authStub.admin, { items: [{ assetId: asset.id, path: '/data/b.jpg' }] });
+
+      expect(result.deleted).toBe(0);
+      expect(mocks.storage.unlink).not.toHaveBeenCalled();
+    });
+
+    it('should keep the copy when its own content changed', async () => {
+      const asset = setup();
+      mocks.crypto.hashFile.mockImplementation((path) =>
+        Promise.resolve(path === '/data/b.jpg' ? Buffer.from('edited') : checksum),
+      );
+
+      const result = await sut.deleteExternalCopies(authStub.admin, { items: [{ assetId: asset.id, path: '/data/b.jpg' }] });
+
+      expect(result.deleted).toBe(0);
+      expect(mocks.storage.unlink).not.toHaveBeenCalled();
+    });
+
+    it('should refuse a path that is not a known copy', async () => {
+      const asset = setup();
+
+      const result = await sut.deleteExternalCopies(authStub.admin, { items: [{ assetId: asset.id, path: '/etc/passwd' }] });
+
+      expect(result.deleted).toBe(0);
+      expect(mocks.storage.unlink).not.toHaveBeenCalled();
+    });
+
+    it('should require access to every asset', async () => {
+      await expect(
+        sut.deleteExternalCopies(authStub.admin, { items: [{ assetId: 'asset-id', path: '/data/b.jpg' }] }),
+      ).rejects.toBeInstanceOf(BadRequestException);
+      expect(mocks.storage.unlink).not.toHaveBeenCalled();
+    });
+  });
+
   describe('delete', () => {
     it('should delete a library', async () => {
       const library = factory.library();

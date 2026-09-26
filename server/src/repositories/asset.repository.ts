@@ -855,6 +855,21 @@ export class AssetRepository {
     return copies;
   }
 
+  @GenerateSql({ params: [DummyValue.UUID] })
+  async getExternalCopiesByOwner(ownerId: string) {
+    const rows = await this.db
+      .selectFrom('asset_metadata')
+      .innerJoin('asset', 'asset.id', 'asset_metadata.assetId')
+      .select(['asset.id', 'asset.originalPath', 'asset.originalFileName', 'asset_metadata.value'])
+      .where('asset_metadata.key', '=', EXTERNAL_COPIES_KEY)
+      .where('asset.ownerId', '=', asUuid(ownerId))
+      .where('asset.deletedAt', 'is', null)
+      .orderBy('asset.originalPath')
+      .execute();
+
+    return rows.map(({ value, ...asset }) => ({ ...asset, copies: toPaths(value).sort() }));
+  }
+
   @GenerateSql({ params: [DummyValue.UUID, DummyValue.STRING] })
   async getExternalCopyOwnerId(libraryId: string, path: string): Promise<string | undefined> {
     const row = await this.db

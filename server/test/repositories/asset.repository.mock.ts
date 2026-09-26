@@ -26,6 +26,7 @@ export const newAssetRepositoryMock = (): Mocked<RepositoryInterface<AssetReposi
     getExternalCopies: vitest.fn().mockResolvedValue([]),
     getExternalCopiesByAssetIds: vitest.fn().mockResolvedValue(new Map()),
     getExternalCopyOwnerId: vitest.fn(),
+    getExternalCopiesByOwner: vitest.fn().mockResolvedValue([]),
     addExternalCopy: vitest.fn(),
     removeExternalCopy: vitest.fn(),
     swapExternalOriginal: vitest.fn(),

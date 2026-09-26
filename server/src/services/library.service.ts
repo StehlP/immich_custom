@@ -8,7 +8,7 @@ import picomatch from 'picomatch';
 import { JOBS_LIBRARY_PAGINATION_SIZE } from 'src/constants';
 import { StorageCore } from 'src/cores/storage.core';
 import { OnEvent, OnJob } from 'src/decorators';
-import { AssetCopyOriginalDto } from 'src/dtos/asset-copy.dto';
+import { AssetCopyDeleteDto, AssetCopyDeleteResult, AssetCopyOriginalDto } from 'src/dtos/asset-copy.dto';
 import { AuthDto } from 'src/dtos/auth.dto';
 import {
   CreateLibraryDto,
@@ -647,6 +647,74 @@ export class LibraryService extends BaseService {
       values: this.getOriginalValues(dto.path, asset.status),
     });
     await this.queuePostSyncJobs([id]);
+  }
+
+  getExternalCopiesOverview(auth: AuthDto) {
+    return this.assetRepository.getExternalCopiesByOwner(auth.user.id);
+  }
+
+  async deleteExternalCopies(auth: AuthDto, dto: AssetCopyDeleteDto): Promise<AssetCopyDeleteResult> {
+    const assetIds = [...new Set(dto.items.map(({ assetId }) => assetId))];
+    await this.requireAccess({ auth, permission: Permission.AssetDelete, ids: assetIds });
+
+    const result: AssetCopyDeleteResult = { deleted: 0, failed: [] };
+    for (const { assetId, path } of dto.items) {
+      const reason = await this.deleteExternalCopy(assetId, path);
+      if (reason) {
+        this.logger.warn(`Not deleting copy ${path} of asset ${assetId}: ${reason}`);
+        result.failed.push({ path, reason });
+      } else {
+        result.deleted++;
+      }
+    }
+
+    return result;
+  }
+
+  /** returns why the copy was kept, or nothing once it is deleted */
+  private async deleteExternalCopy(assetId: string, path: string): Promise<string | undefined> {
+    const asset = await this.assetRepository.getById(assetId);
+    if (!asset?.libraryId || asset.checksumAlgorithm !== ChecksumAlgorithm.sha1File) {
+      return 'Photo introuvable ou hors bibliothèque externe';
+    }
+
+    if (path === asset.originalPath) {
+      return "C'est le fichier original";
+    }
+
+    const copies = await this.assetRepository.getExternalCopies(assetId);
+    if (!copies.includes(path)) {
+      return "Ce fichier n'est pas une copie connue de la photo";
+    }
+
+    if (!(await this.storageRepository.checkFileExists(asset.originalPath))) {
+      return 'Original introuvable sur le disque';
+    }
+
+    // the original must still hold the image, otherwise this copy may be its last intact version
+    let originalChecksum: Buffer;
+    let copyChecksum: Buffer;
+    try {
+      [originalChecksum, copyChecksum] = await Promise.all([
+        this.cryptoRepository.hashFile(asset.originalPath),
+        this.cryptoRepository.hashFile(path),
+      ]);
+    } catch (error) {
+      return `Lecture impossible : ${error}`;
+    }
+
+    if (!originalChecksum.equals(asset.checksum)) {
+      return "L'original a été modifié depuis son import";
+    }
+
+    if (!copyChecksum.equals(asset.checksum)) {
+      return "La copie n'est plus identique à l'original";
+    }
+
+    await this.storageRepository.unlink(path);
+    await this.assetRepository.removeExternalCopy(assetId, path);
+    this.logger.log(`Deleted identical copy ${path} of asset ${assetId}, original kept at ${asset.originalPath}`);
+    return undefined;
   }
 
   async queueScan(id: string) {
