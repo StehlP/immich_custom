@@ -452,7 +452,8 @@ export type JobItem =
   | { name: JobName.AssetEditThumbnailGeneration; data: IEntityJob }
 
   // iPhone upload (custom)
-  | { name: JobName.IphoneUploadAdopt; data: IEntityJob };
+  | { name: JobName.IphoneUploadAdopt; data: IEntityJob }
+  | { name: JobName.IphoneUploadQueueAll; data?: IBaseJob };
 
 export type VectorExtension = (typeof VECTOR_EXTENSIONS)[number];
 

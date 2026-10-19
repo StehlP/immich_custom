@@ -27,6 +27,8 @@ export const IPHONE_UPLOAD_ENV = 'IMMICH_IPHONE_UPLOAD';
 const SWEEP_CRON_NAME = 'IphoneUploadSweep';
 const SWEEP_CRON_EXPRESSION = '0 * * * *';
 const SWEEP_MIN_AGE_MS = 60 * 60 * 1000;
+// a manual run skips only very recent uploads, whose video may still be transcoding
+const MANUAL_SWEEP_MIN_AGE_MS = 10 * 60 * 1000;
 const TMP_SUFFIX = '.immich-tmp';
 const MAX_NAME_ATTEMPTS = 1000;
 
@@ -160,19 +162,36 @@ export class IphoneUploadService extends BaseService {
     }
   }
 
-  async sweep() {
+  async sweep(minAgeMs = SWEEP_MIN_AGE_MS) {
     const targets = await this.getTargets({ refresh: true });
     const ids = await this.assetRepository.getIphoneUploadCandidateIds(
       [...targets.keys()],
-      new Date(Date.now() - SWEEP_MIN_AGE_MS),
+      new Date(Date.now() - minAgeMs),
     );
 
     if (ids.length === 0) {
-      return;
+      return 0;
     }
 
     this.logger.log(`Queueing ${ids.length} upload(s) to move to their iPhone upload folder`);
     await this.jobRepository.queueAll(ids.map((id) => ({ name: JobName.IphoneUploadAdopt, data: { id } })));
+    return ids.length;
+  }
+
+  // started from the "Create job" dialog of the jobs page
+  @OnJob({ name: JobName.IphoneUploadQueueAll, queue: QueueName.BackgroundTask })
+  async handleQueueAll(): Promise<JobStatus> {
+    if (!this.isEnabled()) {
+      this.logger.warn(`Not looking for pending iPhone uploads: ${IPHONE_UPLOAD_ENV} is not set`);
+      return JobStatus.Skipped;
+    }
+
+    const count = await this.sweep(MANUAL_SWEEP_MIN_AGE_MS);
+    if (count === 0) {
+      this.logger.log('No pending iPhone upload to move');
+    }
+
+    return JobStatus.Success;
   }
 
   // runs on the storage template queue, one job at a time, so it never races a storage template move

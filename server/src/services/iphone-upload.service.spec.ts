@@ -208,6 +208,38 @@ describe(IphoneUploadService.name, () => {
     });
   });
 
+  describe('handleQueueAll', () => {
+    it('should queue uploads older than ten minutes', async () => {
+      vitest.useFakeTimers({ now: new Date('2026-10-01T12:00:00.000Z') });
+      mocks.asset.getIphoneUploadCandidateIds.mockResolvedValue(['a']);
+
+      await expect(sut.handleQueueAll()).resolves.toBe(JobStatus.Success);
+
+      expect(mocks.asset.getIphoneUploadCandidateIds).toHaveBeenCalledWith(
+        [userId],
+        new Date('2026-10-01T11:50:00.000Z'),
+      );
+      expect(mocks.job.queueAll).toHaveBeenCalledWith([{ name: JobName.IphoneUploadAdopt, data: { id: 'a' } }]);
+      vitest.useRealTimers();
+    });
+
+    it('should succeed when nothing is pending', async () => {
+      mocks.asset.getIphoneUploadCandidateIds.mockResolvedValue([]);
+
+      await expect(sut.handleQueueAll()).resolves.toBe(JobStatus.Success);
+
+      expect(mocks.job.queueAll).not.toHaveBeenCalled();
+    });
+
+    it('should skip when no user is configured', async () => {
+      delete process.env[IPHONE_UPLOAD_ENV];
+
+      await expect(sut.handleQueueAll()).resolves.toBe(JobStatus.Skipped);
+
+      expect(mocks.asset.getIphoneUploadCandidateIds).not.toHaveBeenCalled();
+    });
+  });
+
   describe('handleAdopt', () => {
     it('should move an upload into the month folder and attach it to the library', async () => {
       addAssets(makeUpload());

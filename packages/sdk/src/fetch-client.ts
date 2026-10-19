@@ -8155,7 +8155,8 @@ export enum ManualJobName {
     IntegrityChecksumMismatchRefresh = "integrity-checksum-mismatch-refresh",
     IntegrityMissingFilesDeleteAll = "integrity-missing-files-delete-all",
     IntegrityUntrackedFilesDeleteAll = "integrity-untracked-files-delete-all",
-    IntegrityChecksumMismatchDeleteAll = "integrity-checksum-mismatch-delete-all"
+    IntegrityChecksumMismatchDeleteAll = "integrity-checksum-mismatch-delete-all",
+    IphoneUploadSweep = "iphone-upload-sweep"
 }
 export enum QueueName {
     ThumbnailGeneration = "thumbnailGeneration",
@@ -8279,7 +8280,9 @@ export enum JobName {
     IntegrityChecksumFiles = "IntegrityChecksumFiles",
     IntegrityChecksumFilesRefresh = "IntegrityChecksumFilesRefresh",
     IntegrityDeleteReportType = "IntegrityDeleteReportType",
-    IntegrityDeleteReports = "IntegrityDeleteReports"
+    IntegrityDeleteReports = "IntegrityDeleteReports",
+    IphoneUploadAdopt = "IphoneUploadAdopt",
+    IphoneUploadQueueAll = "IphoneUploadQueueAll"
 }
 export enum SearchOrderField {
     FileCreatedAt = "fileCreatedAt",

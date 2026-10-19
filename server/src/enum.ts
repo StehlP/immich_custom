@@ -447,6 +447,7 @@ export enum ManualJobName {
   IntegrityMissingFilesDeleteAll = `integrity-missing-files-delete-all`,
   IntegrityUntrackedFilesDeleteAll = `integrity-untracked-files-delete-all`,
   IntegrityChecksumFilesDeleteAll = `integrity-checksum-mismatch-delete-all`,
+  IphoneUploadSweep = 'iphone-upload-sweep',
 }
 
 export const ManualJobNameSchema = z.enum(ManualJobName).describe('Manual job name').meta({ id: 'ManualJobName' });
@@ -938,6 +939,7 @@ export enum JobName {
 
   // iPhone upload (custom)
   IphoneUploadAdopt = 'IphoneUploadAdopt',
+  IphoneUploadQueueAll = 'IphoneUploadQueueAll',
 }
 
 export const JobNameSchema = z.enum(JobName).describe('Job name').meta({ id: 'JobName' });

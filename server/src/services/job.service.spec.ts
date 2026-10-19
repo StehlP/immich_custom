@@ -1,4 +1,4 @@
-import { AssetType, ImmichWorker, JobName, JobStatus, QueueName } from 'src/enum';
+import { AssetType, ImmichWorker, JobName, JobStatus, ManualJobName, QueueName } from 'src/enum';
 import { JobService } from 'src/services/job.service';
 import { JobItem } from 'src/types';
 import { AssetFactory } from 'test/factories/asset.factory';
@@ -17,6 +17,14 @@ describe(JobService.name, () => {
 
   it('should work', () => {
     expect(sut).toBeDefined();
+  });
+
+  describe('create', () => {
+    it('should queue the iPhone upload sweep', async () => {
+      await sut.create({ name: ManualJobName.IphoneUploadSweep });
+
+      expect(mocks.job.queue).toHaveBeenCalledWith({ name: JobName.IphoneUploadQueueAll });
+    });
   });
 
   describe('onJobRun', () => {

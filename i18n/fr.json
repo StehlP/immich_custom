@@ -126,6 +126,7 @@
     "integrity_checks_untracked_files": "Fichiers non suivis",
     "integrity_checks_untracked_files_description": "Configurer la fréquence et l'activation de la vérification des fichiers non suivis",
     "integrity_checks_untracked_files_enable_description": "Activer la vérification des fichiers non suivis",
+    "iphone_upload_sweep_job": "Déplacer les envois iPhone en attente",
     "job_concurrency": "{job} : nombre de tâches simultanées",
     "job_created": "Tâche créée",
     "job_not_concurrency_safe": "Cette tâche ne peut pas être exécutée en multitâche de façon sûre.",
