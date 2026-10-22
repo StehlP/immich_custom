@@ -12,7 +12,7 @@ import {
   sql,
 } from 'kysely';
 import { jsonArrayFrom } from 'kysely/helpers/postgres';
-import { isEmpty, isUndefined, omitBy } from 'lodash-es';
+import { chunk, isEmpty, isUndefined, omitBy } from 'lodash-es';
 import { InjectKysely } from 'nestjs-kysely';
 import type { AuthDto } from 'src/dtos/auth.dto.js';
 import { LockableProperty, Stack } from 'src/database.js';
@@ -25,6 +25,7 @@ import {
   AssetType,
   AssetVisibility,
   CalendarHeatmapType,
+  ChecksumAlgorithm,
 } from 'src/enum.js';
 import { DB } from 'src/schema/index.js';
 import { AssetAudioTable, AssetKeyframeTable, AssetVideoTable } from 'src/schema/tables/asset-av.table.js';
@@ -57,6 +58,44 @@ import {
 import { globToPostgresRegex } from 'src/utils/misc.js';
 
 export type AssetStats = Record<AssetType, number>;
+
+/** asset_metadata key listing the other files of an external library that have the same content as the asset */
+export const EXTERNAL_COPIES_KEY = 'custom.copies';
+
+const toPaths = (value: unknown): string[] => {
+  const paths = (value as { paths?: unknown } | undefined)?.paths;
+  return Array.isArray(paths) ? paths.filter((path): path is string => typeof path === 'string') : [];
+};
+
+// single statements so that concurrent library jobs cannot overwrite each other's changes
+const editExternalCopies = async (
+  db: Kysely<DB>,
+  assetId: string,
+  { add, remove }: { add?: string; remove?: string },
+) => {
+  const additions = add ? [add] : [];
+  const merged = sql`COALESCE((
+    SELECT jsonb_agg(DISTINCT p)
+    FROM jsonb_array_elements_text(COALESCE(asset_metadata."value"->'paths', '[]'::jsonb) || to_jsonb(${additions}::text[])) AS t(p)
+    WHERE p IS DISTINCT FROM ${remove ?? null}::text
+  ), '[]'::jsonb)`;
+
+  await (add
+    ? sql`
+      INSERT INTO asset_metadata ("assetId", "key", "value")
+      VALUES (${assetId}::uuid, ${EXTERNAL_COPIES_KEY}, jsonb_build_object('paths', to_jsonb(${additions}::text[])))
+      ON CONFLICT ("assetId", "key") DO UPDATE SET "value" = jsonb_build_object('paths', ${merged})`.execute(db)
+    : sql`
+      UPDATE asset_metadata SET "value" = jsonb_build_object('paths', ${merged})
+      WHERE "assetId" = ${assetId}::uuid AND "key" = ${EXTERNAL_COPIES_KEY}`.execute(db));
+
+  await db
+    .deleteFrom('asset_metadata')
+    .where('assetId', '=', asUuid(assetId))
+    .where('key', '=', EXTERNAL_COPIES_KEY)
+    .where(sql<boolean>`"value"->'paths' = '[]'::jsonb`)
+    .execute();
+};
 
 export interface BoundingBox {
   west: number;
@@ -453,7 +492,13 @@ export class AssetRepository {
     if (assets.length === 0) {
       return [];
     }
-    const ids = await this.db.insertInto('asset').values(assets).returning('id').execute();
+    // a duplicate checksum in a batch must not fail the whole import
+    const ids = await this.db
+      .insertInto('asset')
+      .values(assets)
+      .onConflict((oc) => oc.doNothing())
+      .returning('id')
+      .execute();
     return ids.map(({ id }) => id);
   }
 
@@ -686,11 +731,177 @@ export class AssetRepository {
       .select('id')
       .where('ownerId', '=', asUuid(ownerId))
       .where('checksum', '=', checksum)
-      .where('libraryId', 'is', null)
+      // external assets hashed by content count as already uploaded
+      .where((eb) => eb.or([eb('libraryId', 'is', null), eb('checksumAlgorithm', '=', ChecksumAlgorithm.sha1File)]))
       .limit(1)
       .executeTakeFirst();
 
     return asset?.id;
+  }
+
+  @GenerateSql({ params: [DummyValue.UUID] })
+  getForIphoneUpload(id: string) {
+    return this.db
+      .selectFrom('asset')
+      .select([
+        'asset.id',
+        'asset.ownerId',
+        'asset.libraryId',
+        'asset.originalPath',
+        'asset.originalFileName',
+        'asset.checksum',
+        'asset.localDateTime',
+        'asset.type',
+        'asset.visibility',
+        'asset.deletedAt',
+        'asset.livePhotoVideoId',
+      ])
+      .select(withFiles)
+      .where('asset.id', '=', asUuid(id))
+      .limit(1)
+      .executeTakeFirst();
+  }
+
+  @GenerateSql({ params: [DummyValue.UUID] })
+  async getLivePhotoStillId(videoId: string): Promise<string | undefined> {
+    const asset = await this.db
+      .selectFrom('asset')
+      .select('id')
+      .where('livePhotoVideoId', '=', asUuid(videoId))
+      .limit(1)
+      .executeTakeFirst();
+
+    return asset?.id;
+  }
+
+  @GenerateSql({ params: [[DummyValue.UUID], DummyValue.DATE] })
+  async getIphoneUploadCandidateIds(ownerIds: string[], updatedBefore: Date): Promise<string[]> {
+    if (ownerIds.length === 0) {
+      return [];
+    }
+
+    const assets = await this.db
+      .selectFrom('asset')
+      .select('asset.id')
+      .innerJoin('asset_job_status', 'asset_job_status.assetId', 'asset.id')
+      .where('asset.ownerId', '=', anyUuid(ownerIds))
+      .where('asset.libraryId', 'is', null)
+      .where('asset.deletedAt', 'is', null)
+      .where('asset.visibility', 'in', [AssetVisibility.Timeline, AssetVisibility.Archive])
+      .where('asset.updatedAt', '<', updatedBefore)
+      .where('asset_job_status.metadataExtractedAt', 'is not', null)
+      .where((eb) =>
+        eb.exists((qb) =>
+          qb
+            .selectFrom('asset_file')
+            .whereRef('asset_file.assetId', '=', 'asset.id')
+            .where('asset_file.type', '=', AssetFileType.Preview),
+        ),
+      )
+      .execute();
+
+    return assets.map(({ id }) => id);
+  }
+
+  /** only touches assets whose originalPath still matches, so a concurrently detected move is not overwritten */
+  async updateAllIfPathUnchanged(
+    assets: Array<{ id: string; originalPath: string }>,
+    options: Updateable<AssetTable>,
+  ): Promise<void> {
+    for (const batch of chunk(assets, 1000)) {
+      await this.db
+        .updateTable('asset')
+        .set(options)
+        .where((eb) =>
+          eb.or(
+            batch.map(({ id, originalPath }) =>
+              eb.and([eb('id', '=', asUuid(id)), eb('originalPath', '=', originalPath)]),
+            ),
+          ),
+        )
+        .execute();
+    }
+  }
+
+  @GenerateSql({ params: [DummyValue.UUID] })
+  async getExternalCopies(assetId: string): Promise<string[]> {
+    const row = await this.db
+      .selectFrom('asset_metadata')
+      .select('value')
+      .where('assetId', '=', asUuid(assetId))
+      .where('key', '=', EXTERNAL_COPIES_KEY)
+      .executeTakeFirst();
+
+    return toPaths(row?.value);
+  }
+
+  @GenerateSql({ params: [[DummyValue.UUID]] })
+  async getExternalCopiesByAssetIds(assetIds: string[]): Promise<Map<string, string[]>> {
+    const copies = new Map<string, string[]>();
+    if (assetIds.length === 0) {
+      return copies;
+    }
+
+    const rows = await this.db
+      .selectFrom('asset_metadata')
+      .select(['assetId', 'value'])
+      .where('assetId', '=', anyUuid(assetIds))
+      .where('key', '=', EXTERNAL_COPIES_KEY)
+      .execute();
+
+    for (const row of rows) {
+      copies.set(row.assetId, toPaths(row.value));
+    }
+    return copies;
+  }
+
+  @GenerateSql({ params: [DummyValue.UUID] })
+  async getExternalCopiesByOwner(ownerId: string) {
+    const rows = await this.db
+      .selectFrom('asset_metadata')
+      .innerJoin('asset', 'asset.id', 'asset_metadata.assetId')
+      .select(['asset.id', 'asset.originalPath', 'asset.originalFileName', 'asset.fileCreatedAt', 'asset_metadata.value'])
+      .where('asset_metadata.key', '=', EXTERNAL_COPIES_KEY)
+      .where('asset.ownerId', '=', asUuid(ownerId))
+      .where('asset.deletedAt', 'is', null)
+      .orderBy('asset.fileCreatedAt', 'desc')
+      .execute();
+
+    return rows.map(({ value, ...asset }) => ({ ...asset, copies: toPaths(value).sort() }));
+  }
+
+  @GenerateSql({ params: [DummyValue.UUID, DummyValue.STRING] })
+  async getExternalCopyOwnerId(libraryId: string, path: string): Promise<string | undefined> {
+    const row = await this.db
+      .selectFrom('asset_metadata')
+      .innerJoin('asset', 'asset.id', 'asset_metadata.assetId')
+      .select('asset_metadata.assetId')
+      .where('asset_metadata.key', '=', EXTERNAL_COPIES_KEY)
+      .where('asset.libraryId', '=', asUuid(libraryId))
+      .where(sql<boolean>`asset_metadata."value"->'paths' @> jsonb_build_array(${path}::text)`)
+      .limit(1)
+      .executeTakeFirst();
+
+    return row?.assetId;
+  }
+
+  async addExternalCopy(assetId: string, path: string): Promise<void> {
+    await this.db.transaction().execute((trx) => editExternalCopies(trx, assetId, { add: path }));
+  }
+
+  async removeExternalCopy(assetId: string, path: string): Promise<void> {
+    await this.db.transaction().execute((trx) => editExternalCopies(trx, assetId, { remove: path }));
+  }
+
+  /** makes `to` the original file of the asset, and optionally keeps `from` as a copy */
+  async swapExternalOriginal(
+    assetId: string,
+    { from, to, keepFrom, values }: { from: string; to: string; keepFrom: boolean; values: Updateable<AssetTable> },
+  ): Promise<void> {
+    await this.db.transaction().execute(async (trx) => {
+      await trx.updateTable('asset').set(values).where('id', '=', asUuid(assetId)).execute();
+      await editExternalCopies(trx, assetId, { remove: to, add: keepFrom ? from : undefined });
+    });
   }
 
   findLivePhotoMatch(options: LivePhotoSearchOptions) {

@@ -1,5 +1,6 @@
 import { BadRequestException, Injectable } from '@nestjs/common';
-import { Insertable } from 'kysely';
+import { Insertable, Updateable } from 'kysely';
+import { chunk } from 'lodash-es';
 import { R_OK } from 'node:constants';
 import { Stats } from 'node:fs';
 import path, { isAbsolute, parse } from 'node:path';
@@ -9,6 +10,8 @@ import type { JobOf } from 'src/types.js';
 import { JOBS_LIBRARY_PAGINATION_SIZE } from 'src/constants.js';
 import { StorageCore } from 'src/cores/storage.core.js';
 import { OnEvent, OnJob } from 'src/decorators.js';
+import { AssetCopyDeleteDto, AssetCopyDeleteResult, AssetCopyOriginalDto } from 'src/dtos/asset-copy.dto.js';
+import { AuthDto } from 'src/dtos/auth.dto.js';
 import {
   CreateLibraryDto,
   LibraryResponseDto,
@@ -28,6 +31,7 @@ import {
   ImmichWorker,
   JobName,
   JobStatus,
+  Permission,
   QueueName,
 } from 'src/enum.js';
 import { AssetSyncResult } from 'src/repositories/library.repository.js';
@@ -35,6 +39,16 @@ import { AssetTable } from 'src/schema/tables/asset.table.js';
 import { BaseService } from 'src/services/base.service.js';
 import { mimeTypes } from 'src/utils/mime-types.js';
 import { batched, findOrFail, handlePromiseError } from 'src/utils/misc.js';
+
+const LIBRARY_HASH_CONCURRENCY = 8;
+const LIBRARY_SAVE_BATCH_SIZE = 1000;
+const LIBRARY_RECENT_CHANGE_DELAY_MS = 5 * 60 * 1000;
+
+type FileSyncResult =
+  | { action: 'create'; checksum: Buffer; asset: Insertable<AssetTable> }
+  | { action: 'move'; checksum: Buffer; id: string; values: Updateable<AssetTable> }
+  | { action: 'copy'; id: string; path: string }
+  | { action: 'skip' };
 
 @Injectable()
 export class LibraryService extends BaseService {
@@ -263,26 +277,83 @@ export class LibraryService extends BaseService {
       return JobStatus.Failed;
     }
 
-    const assetImports: Insertable<AssetTable>[] = [];
-    await Promise.all(
-      job.paths.map(async (path) => {
-        try {
-          const asset = await this.processEntity(path, library.ownerId, job.libraryId);
-          assetImports.push(asset);
-        } catch (error) {
-          this.logger.error(`Error processing ${path} for library ${job.libraryId}: ${error}`);
-        }
-      }),
-    );
+    // file watcher events are not pre-filtered like the disk crawl
+    const paths = await this.assetRepository.filterNewExternalAssetPaths(library.id, job.paths);
+
+    const seenChecksums = new Set<string>();
+    let processed = 0;
+
+    // hashing a batch of 10k files takes a long time, so save progress regularly
+    for (const saveBatch of chunk(paths, LIBRARY_SAVE_BATCH_SIZE)) {
+      const assetImports: Insertable<AssetTable>[] = [];
+      const moves: Array<{ id: string; values: Updateable<AssetTable> }> = [];
+      const copies: Array<{ id: string; path: string }> = [];
+
+      // hashing reads whole files, so limit how many are open at once
+      for (const hashBatch of chunk(saveBatch, LIBRARY_HASH_CONCURRENCY)) {
+        await Promise.all(
+          hashBatch.map(async (path) => {
+            try {
+              const result = await this.processEntity(path, library.ownerId, job.libraryId);
+              if (result.action === 'skip') {
+                return;
+              }
+
+              if (result.action === 'copy') {
+                copies.push({ id: result.id, path: result.path });
+                return;
+              }
+
+              const key = result.checksum.toString('hex');
+              if (seenChecksums.has(key)) {
+                this.logger.debug(`Skipping ${path}, same content as another file in this batch`);
+                return;
+              }
+              seenChecksums.add(key);
+
+              if (result.action === 'move') {
+                moves.push({ id: result.id, values: result.values });
+              } else {
+                assetImports.push(result.asset);
+              }
+            } catch (error) {
+              this.logger.error(`Error processing ${path} for library ${job.libraryId}: ${error}`);
+            }
+          }),
+        );
+      }
+
+      processed += saveBatch.length;
+      await this.saveSyncedFiles(library, assetImports, moves, copies, `${processed} of ${paths.length} in this job`);
+    }
+
+    return JobStatus.Success;
+  }
+
+  private async saveSyncedFiles(
+    library: { id: string; ownerId: string },
+    assetImports: Insertable<AssetTable>[],
+    moves: Array<{ id: string; values: Updateable<AssetTable> }>,
+    copies: Array<{ id: string; path: string }>,
+    progress: string,
+  ) {
+    for (const move of moves) {
+      await this.assetRepository.updateAll([move.id], move.values);
+    }
+
+    for (const copy of copies) {
+      await this.assetRepository.addExternalCopy(copy.id, copy.path);
+    }
+    if (copies.length > 0) {
+      this.logger.log(`Recorded ${copies.length} identical copy(ies) in library ${library.id}`);
+    }
 
     const assetIds = await this.assetRepository.createAll(assetImports);
 
-    const progressMessage =
-      job.progressCounter && job.totalAssets
-        ? `(${job.progressCounter} of ${job.totalAssets})`
-        : `(${job.progressCounter} done so far)`;
-
-    this.logger.log(`Imported ${assetIds.length} ${progressMessage} file(s) into library ${job.libraryId}`);
+    this.logger.log(`Imported ${assetIds.length} file(s) (${progress}) into library ${library.id}`);
+    if (moves.length > 0) {
+      this.logger.log(`Updated path of ${moves.length} moved file(s) in library ${library.id}`);
+    }
 
     await Promise.all(
       assetIds.map((assetId) =>
@@ -290,9 +361,7 @@ export class LibraryService extends BaseService {
       ),
     );
 
-    await this.queuePostSyncJobs(assetIds);
-
-    return JobStatus.Success;
+    await this.queuePostSyncJobs([...assetIds, ...moves.map(({ id }) => id)]);
   }
 
   private async validateImportPath(importPath: string): Promise<ValidateLibraryImportPathResponseDto> {
@@ -399,25 +468,105 @@ export class LibraryService extends BaseService {
     return JobStatus.Success;
   }
 
-  private async processEntity(filePath: string, ownerId: string, libraryId: string) {
+  private async processEntity(filePath: string, ownerId: string, libraryId: string): Promise<FileSyncResult> {
     const assetPath = path.normalize(filePath);
     const stat = await this.storageRepository.stat(assetPath);
+    const checksum = await this.cryptoRepository.hashFile(assetPath);
+    const copyOwnerId = await this.assetRepository.getExternalCopyOwnerId(libraryId, assetPath);
+
+    const existing = await this.assetRepository.getByChecksum({ ownerId, libraryId, checksum });
+    if (existing) {
+      if (existing.status === AssetStatus.Deleted || existing.originalPath === assetPath) {
+        return { action: 'skip' };
+      }
+
+      // the file used to be a copy of another asset but its content changed
+      if (copyOwnerId && copyOwnerId !== existing.id) {
+        await this.assetRepository.removeExternalCopy(copyOwnerId, assetPath);
+      }
+
+      const isMove = !(await this.storageRepository.checkFileExists(existing.originalPath));
+      if (!isMove) {
+        this.logger.debug(`Recording ${assetPath} as a copy of asset ${existing.id} at ${existing.originalPath}`);
+        return { action: 'copy', id: existing.id, path: assetPath };
+      }
+
+      if (copyOwnerId === existing.id) {
+        await this.assetRepository.removeExternalCopy(existing.id, assetPath);
+      }
+
+      this.logger.log(`Detected move of asset ${existing.id}: ${existing.originalPath} => ${assetPath}`);
+      return {
+        action: 'move',
+        checksum,
+        id: existing.id,
+        values: {
+          originalPath: assetPath,
+          originalFileName: parse(assetPath).base,
+          fileModifiedAt: stat.mtime,
+          isOffline: false,
+          // same rule as un-offlining: an asset trashed by the user stays in the trash
+          ...(existing.status === AssetStatus.Trashed ? {} : { deletedAt: null }),
+        },
+      };
+    }
+
+    if (copyOwnerId) {
+      this.logger.debug(`${assetPath} is no longer identical to asset ${copyOwnerId}, importing it separately`);
+      await this.assetRepository.removeExternalCopy(copyOwnerId, assetPath);
+    }
+
+    const upload = await this.assetRepository.getByChecksum({ ownerId, checksum });
+    if (upload && !StorageCore.isImmichPath(upload.originalPath)) {
+      this.logger.debug(`Skipping ${assetPath}, upload ${upload.id} is being moved into this library`);
+      return { action: 'skip' };
+    }
 
     return {
-      ownerId,
-      libraryId,
-      checksum: this.cryptoRepository.hashSha1(`path:${assetPath}`),
-      checksumAlgorithm: ChecksumAlgorithm.sha1Path,
-      originalPath: assetPath,
+      action: 'create',
+      checksum,
+      asset: {
+        ownerId,
+        libraryId,
+        checksum,
+        checksumAlgorithm: ChecksumAlgorithm.sha1File,
+        originalPath: assetPath,
 
-      fileCreatedAt: stat.mtime,
-      fileModifiedAt: stat.mtime,
-      localDateTime: stat.mtime,
-      type: mimeTypes.isVideo(assetPath) ? AssetType.Video : AssetType.Image,
-      originalFileName: parse(assetPath).base,
-      isExternal: true,
-      livePhotoVideoId: null,
+        fileCreatedAt: stat.mtime,
+        fileModifiedAt: stat.mtime,
+        localDateTime: stat.mtime,
+        type: mimeTypes.isVideo(assetPath) ? AssetType.Video : AssetType.Image,
+        originalFileName: parse(assetPath).base,
+        isExternal: true,
+        livePhotoVideoId: null,
+      },
     };
+  }
+
+  private async filterRecentlyChangedPaths(paths: string[]): Promise<string[]> {
+    const threshold = Date.now() - LIBRARY_RECENT_CHANGE_DELAY_MS;
+    const stats = await Promise.all(
+      paths.map(async (path) => {
+        try {
+          const stat: Partial<Stats> = await this.storageRepository.stat(path);
+          return stat;
+        } catch {
+          return null;
+        }
+      }),
+    );
+
+    const ready = paths.filter((_, index) => {
+      const stat = stats[index];
+      const changedAt = Math.max(stat?.ctime?.getTime() ?? 0, stat?.mtime?.getTime() ?? 0);
+      return changedAt < threshold;
+    });
+
+    if (ready.length < paths.length) {
+      this.logger.log(`Postponing import of ${paths.length - ready.length} recently changed file(s) to the next scan`);
+    }
+
+    return ready;
   }
 
   async queuePostSyncJobs(assetIds: string[]) {
@@ -430,6 +579,145 @@ export class LibraryService extends BaseService {
         data: { id: assetId, source: 'upload' },
       })),
     );
+  }
+
+  /** when the original file is gone, points the asset to the first identical copy still on disk */
+  private async switchToExistingCopy(
+    asset: { id: string; originalPath: string; status: AssetStatus },
+    copies: string[],
+  ): Promise<boolean> {
+    for (const copy of copies) {
+      if (!(await this.storageRepository.checkFileExists(copy))) {
+        await this.assetRepository.removeExternalCopy(asset.id, copy);
+        continue;
+      }
+
+      await this.assetRepository.swapExternalOriginal(asset.id, {
+        from: asset.originalPath,
+        to: copy,
+        keepFrom: false,
+        values: this.getOriginalValues(copy, asset.status),
+      });
+      await this.queuePostSyncJobs([asset.id]);
+      this.logger.log(`Original of asset ${asset.id} is gone, switched to its copy: ${asset.originalPath} => ${copy}`);
+      return true;
+    }
+
+    return false;
+  }
+
+  private async removeMissingCopies(assetId: string, copies: string[]) {
+    for (const copy of copies) {
+      if (!(await this.storageRepository.checkFileExists(copy))) {
+        this.logger.debug(`Copy ${copy} of asset ${assetId} no longer exists`);
+        await this.assetRepository.removeExternalCopy(assetId, copy);
+      }
+    }
+  }
+
+  private getOriginalValues(originalPath: string, status: AssetStatus): Updateable<AssetTable> {
+    return {
+      originalPath,
+      originalFileName: parse(originalPath).base,
+      isOffline: false,
+      // an asset trashed by the user stays in the trash
+      ...(status === AssetStatus.Trashed ? {} : { deletedAt: null }),
+    };
+  }
+
+  async setExternalOriginal(auth: AuthDto, id: string, dto: AssetCopyOriginalDto): Promise<void> {
+    await this.requireAccess({ auth, permission: Permission.AssetUpdate, ids: [id] });
+
+    const asset = await this.assetRepository.getById(id);
+    if (!asset?.libraryId) {
+      throw new BadRequestException('Asset is not part of an external library');
+    }
+
+    const copies = await this.assetRepository.getExternalCopies(id);
+    if (!copies.includes(dto.path)) {
+      throw new BadRequestException('This file is not a known copy of the asset');
+    }
+
+    if (!(await this.storageRepository.checkFileExists(dto.path))) {
+      await this.assetRepository.removeExternalCopy(id, dto.path);
+      throw new BadRequestException('This copy no longer exists on disk');
+    }
+
+    await this.assetRepository.swapExternalOriginal(id, {
+      from: asset.originalPath,
+      to: dto.path,
+      keepFrom: await this.storageRepository.checkFileExists(asset.originalPath),
+      values: this.getOriginalValues(dto.path, asset.status),
+    });
+    await this.queuePostSyncJobs([id]);
+  }
+
+  getExternalCopiesOverview(auth: AuthDto) {
+    return this.assetRepository.getExternalCopiesByOwner(auth.user.id);
+  }
+
+  async deleteExternalCopies(auth: AuthDto, dto: AssetCopyDeleteDto): Promise<AssetCopyDeleteResult> {
+    const assetIds = [...new Set(dto.items.map(({ assetId }) => assetId))];
+    await this.requireAccess({ auth, permission: Permission.AssetDelete, ids: assetIds });
+
+    const result: AssetCopyDeleteResult = { deleted: 0, failed: [] };
+    for (const { assetId, path } of dto.items) {
+      const reason = await this.deleteExternalCopy(assetId, path);
+      if (reason) {
+        this.logger.warn(`Not deleting copy ${path} of asset ${assetId}: ${reason}`);
+        result.failed.push({ path, reason });
+      } else {
+        result.deleted++;
+      }
+    }
+
+    return result;
+  }
+
+  /** returns why the copy was kept, or nothing once it is deleted */
+  private async deleteExternalCopy(assetId: string, path: string): Promise<string | undefined> {
+    const asset = await this.assetRepository.getById(assetId);
+    if (!asset?.libraryId || asset.checksumAlgorithm !== ChecksumAlgorithm.sha1File) {
+      return 'Photo introuvable ou hors bibliothèque externe';
+    }
+
+    if (path === asset.originalPath) {
+      return "C'est le fichier original";
+    }
+
+    const copies = await this.assetRepository.getExternalCopies(assetId);
+    if (!copies.includes(path)) {
+      return "Ce fichier n'est pas une copie connue de la photo";
+    }
+
+    if (!(await this.storageRepository.checkFileExists(asset.originalPath))) {
+      return 'Original introuvable sur le disque';
+    }
+
+    // the original must still hold the image, otherwise this copy may be its last intact version
+    let originalChecksum: Buffer;
+    let copyChecksum: Buffer;
+    try {
+      [originalChecksum, copyChecksum] = await Promise.all([
+        this.cryptoRepository.hashFile(asset.originalPath),
+        this.cryptoRepository.hashFile(path),
+      ]);
+    } catch (error) {
+      return `Lecture impossible : ${error}`;
+    }
+
+    if (!originalChecksum.equals(asset.checksum)) {
+      return "L'original a été modifié depuis son import";
+    }
+
+    if (!copyChecksum.equals(asset.checksum)) {
+      return "La copie n'est plus identique à l'original";
+    }
+
+    await this.storageRepository.unlink(path);
+    await this.assetRepository.removeExternalCopy(assetId, path);
+    this.logger.log(`Deleted identical copy ${path} of asset ${assetId}, original kept at ${asset.originalPath}`);
+    return undefined;
   }
 
   async queueScan(id: string) {
@@ -479,8 +767,8 @@ export class LibraryService extends BaseService {
   async handleSyncAssets(job: JobOf<JobName.LibrarySyncAssets>): Promise<JobStatus> {
     const assets = await this.assetJobRepository.getForSyncAssets(job.assetIds);
 
-    const assetIdsToOffline: string[] = [];
-    const trashedAssetIdsToOffline: string[] = [];
+    const assetIdsToOffline: Array<{ id: string; originalPath: string }> = [];
+    const trashedAssetIdsToOffline: Array<{ id: string; originalPath: string }> = [];
     const assetIdsToOnline: string[] = [];
     const trashedAssetIdsToOnline: string[] = [];
     const assetIdsToUpdate: string[] = [];
@@ -491,19 +779,34 @@ export class LibraryService extends BaseService {
       assets.map((asset) => this.storageRepository.stat(asset.originalPath).catch(() => null)),
     );
 
+    const copiesByAssetId = await this.assetRepository.getExternalCopiesByAssetIds(assets.map(({ id }) => id));
+    let switchedCount = 0;
+
     for (let i = 0; i < assets.length; i++) {
       const asset = assets[i];
       const stat = stats[i];
+      const copies = copiesByAssetId.get(asset.id) ?? [];
       const action = this.checkExistingAsset(asset, stat);
+
+      if (action !== AssetSyncResult.OFFLINE && copies.length > 0) {
+        await this.removeMissingCopies(asset.id, copies);
+      }
+
       switch (action) {
         case AssetSyncResult.DO_NOTHING: {
           break;
         }
         case AssetSyncResult.OFFLINE: {
+          if (await this.switchToExistingCopy(asset, copies)) {
+            switchedCount++;
+            break;
+          }
+
+          const item = { id: asset.id, originalPath: asset.originalPath };
           if (asset.status === AssetStatus.Trashed) {
-            trashedAssetIdsToOffline.push(asset.id);
+            trashedAssetIdsToOffline.push(item);
           } else {
-            assetIdsToOffline.push(asset.id);
+            assetIdsToOffline.push(item);
           }
           break;
         }
@@ -545,12 +848,15 @@ export class LibraryService extends BaseService {
     }
 
     const promises = [];
+    // the path guard avoids offlining an asset whose move was detected by a concurrent import
     if (assetIdsToOffline.length > 0) {
-      promises.push(this.assetRepository.updateAll(assetIdsToOffline, { isOffline: true, deletedAt: new Date() }));
+      promises.push(
+        this.assetRepository.updateAllIfPathUnchanged(assetIdsToOffline, { isOffline: true, deletedAt: new Date() }),
+      );
     }
 
     if (trashedAssetIdsToOffline.length > 0) {
-      promises.push(this.assetRepository.updateAll(trashedAssetIdsToOffline, { isOffline: true }));
+      promises.push(this.assetRepository.updateAllIfPathUnchanged(trashedAssetIdsToOffline, { isOffline: true }));
     }
 
     if (assetIdsToOnline.length > 0) {
@@ -567,7 +873,12 @@ export class LibraryService extends BaseService {
 
     await Promise.all(promises);
 
-    const remainingCount = assets.length - assetIdsToOffline.length - assetIdsToUpdate.length - assetIdsToOnline.length;
+    if (switchedCount > 0) {
+      this.logger.log(`${switchedCount} asset(s) switched to an identical copy in library ${job.libraryId}`);
+    }
+
+    const remainingCount =
+      assets.length - assetIdsToOffline.length - assetIdsToUpdate.length - assetIdsToOnline.length - switchedCount;
     const cumulativePercentage = ((100 * job.progressCounter) / job.totalAssets).toFixed(1);
     this.logger.log(
       `Checked existing asset(s): ${assetIdsToOffline.length + trashedAssetIdsToOffline.length} offlined, ${assetIdsToOnline.length + trashedAssetIdsToOnline.length} onlined, ${assetIdsToUpdate.length} updated, ${remainingCount} unchanged of current batch of ${assets.length} (Total progress: ${job.progressCounter} of ${job.totalAssets}, ${cumulativePercentage} %) in library ${job.libraryId}.`,
@@ -656,7 +967,9 @@ export class LibraryService extends BaseService {
 
     for await (const pathBatch of pathsOnDisk) {
       crawlCount += pathBatch.length;
-      const paths = await this.assetRepository.filterNewExternalAssetPaths(library.id, pathBatch);
+      const newPaths = await this.assetRepository.filterNewExternalAssetPaths(library.id, pathBatch);
+      // a file still being copied would be imported with a wrong checksum
+      const paths = await this.filterRecentlyChangedPaths(newPaths);
 
       if (paths.length > 0) {
         importCount += paths.length;
@@ -691,7 +1004,26 @@ export class LibraryService extends BaseService {
     this.logger.verbose(`Deleting asset(s) ${job.paths} from library ${job.libraryId}`);
     for (const assetPath of job.paths) {
       const asset = await this.assetRepository.getByLibraryIdAndOriginalPath(job.libraryId, assetPath);
-      if (asset) {
+      if (!asset) {
+        const copyOwnerId = await this.assetRepository.getExternalCopyOwnerId(job.libraryId, assetPath);
+        if (copyOwnerId) {
+          this.logger.debug(`Copy ${assetPath} of asset ${copyOwnerId} was removed`);
+          await this.assetRepository.removeExternalCopy(copyOwnerId, assetPath);
+        }
+        continue;
+      }
+
+      if (asset.checksumAlgorithm === ChecksumAlgorithm.sha1File) {
+        const copies = await this.assetRepository.getExternalCopies(asset.id);
+        if (await this.switchToExistingCopy(asset, copies)) {
+          continue;
+        }
+        // keep it (offline, in the trash) so a move can be detected when the file reappears elsewhere
+        await this.assetRepository.updateAll(
+          [asset.id],
+          asset.status === AssetStatus.Trashed ? { isOffline: true } : { isOffline: true, deletedAt: new Date() },
+        );
+      } else {
         await this.assetRepository.remove(asset);
       }
     }

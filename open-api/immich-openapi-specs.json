@@ -22839,7 +22839,9 @@
           "IntegrityChecksumFiles",
           "IntegrityChecksumFilesRefresh",
           "IntegrityDeleteReportType",
-          "IntegrityDeleteReports"
+          "IntegrityDeleteReports",
+          "IphoneUploadAdopt",
+          "IphoneUploadQueueAll"
         ],
         "type": "string"
       },
@@ -23190,7 +23192,8 @@
           "integrity-checksum-mismatch-refresh",
           "integrity-missing-files-delete-all",
           "integrity-untracked-files-delete-all",
-          "integrity-checksum-mismatch-delete-all"
+          "integrity-checksum-mismatch-delete-all",
+          "iphone-upload-sweep"
         ],
         "type": "string"
       },

@@ -5,6 +5,7 @@
   import { Icon, modalManager, Text } from '@immich/ui';
   import {
     mdiCellphoneArrowDownVariant,
+    mdiContentCopy,
     mdiContentDuplicate,
     mdiCrosshairsGps,
     mdiImageSizeSelectLarge,
@@ -15,6 +16,7 @@
 
   const links = [
     { href: Route.duplicatesUtility(), icon: mdiContentDuplicate, label: $t('review_duplicates') },
+    { href: Route.exactCopiesUtility(), icon: mdiContentCopy, label: $t('review_exact_copies') },
     { href: Route.largeFileUtility(), icon: mdiImageSizeSelectLarge, label: $t('review_large_files') },
     { href: Route.geolocationUtility(), icon: mdiCrosshairsGps, label: $t('manage_geolocation') },
     { href: Route.workflows(), icon: mdiStateMachine, label: $t('workflows') },

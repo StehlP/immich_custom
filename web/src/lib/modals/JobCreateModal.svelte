@@ -40,6 +40,7 @@
       title: $t('admin.maintenance_integrity_checksum_mismatch_refresh_job'),
       value: ManualJobName.IntegrityChecksumMismatchRefresh,
     },
+    { title: $t('admin.iphone_upload_sweep_job'), value: ManualJobName.IphoneUploadSweep },
   ].map(({ value, title }) => ({ id: value, label: title, value }));
 
   let selectedJob: ComboBoxOption | undefined = $state(undefined);

@@ -476,6 +476,7 @@ export enum ManualJobName {
   IntegrityMissingFilesDeleteAll = `integrity-missing-files-delete-all`,
   IntegrityUntrackedFilesDeleteAll = `integrity-untracked-files-delete-all`,
   IntegrityChecksumFilesDeleteAll = `integrity-checksum-mismatch-delete-all`,
+  IphoneUploadSweep = 'iphone-upload-sweep',
 }
 
 export const ManualJobNameSchema = z.enum(ManualJobName).describe('Manual job name').meta({ id: 'ManualJobName' });
@@ -964,6 +965,10 @@ export enum JobName {
   IntegrityChecksumFilesRefresh = 'IntegrityChecksumFilesRefresh',
   IntegrityDeleteReportType = 'IntegrityDeleteReportType',
   IntegrityDeleteReports = 'IntegrityDeleteReports',
+
+  // iPhone upload (custom)
+  IphoneUploadAdopt = 'IphoneUploadAdopt',
+  IphoneUploadQueueAll = 'IphoneUploadQueueAll',
 }
 
 export const JobNameSchema = z.enum(JobName).describe('Job name').meta({ id: 'JobName' });
@@ -1018,6 +1023,7 @@ export enum DatabaseLock {
   IntegrityCheck = 67,
   VersionCheck = 800,
   HlsSessionCleanup = 850,
+  IphoneUpload = 1338,
 }
 
 export enum MaintenanceAction {
