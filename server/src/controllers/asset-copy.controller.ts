@@ -1,7 +1,7 @@
 import { Body, Controller, Delete, Get, HttpCode, HttpStatus, Param, Put } from '@nestjs/common';
 import { ApiExcludeEndpoint, ApiTags } from '@nestjs/swagger';
 import { AssetCopyDeleteDto, AssetCopyDeleteResult, AssetCopyOriginalDto } from 'src/dtos/asset-copy.dto.js';
-import { AuthDto } from 'src/dtos/auth.dto.js';
+import type { AuthDto } from 'src/dtos/auth.dto.js';
 import { ApiTag, Permission, RouteKey } from 'src/enum.js';
 import { Auth, Authenticated } from 'src/middleware/auth.guard.js';
 import { LibraryService } from 'src/services/library.service.js';
